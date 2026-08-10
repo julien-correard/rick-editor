@@ -1,5 +1,3 @@
-// A MOIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
-
 /*
  * xrick/include/tiles.h
  *

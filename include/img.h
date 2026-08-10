@@ -1,5 +1,3 @@
-// A MOIIIIIIIIIIIIIIIIIIIIIIIIIIIII
-
 /*
  * xrick/include/img.h
  *

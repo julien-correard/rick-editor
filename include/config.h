@@ -1,6 +1,3 @@
-
-// A MOIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
-
 /*
  * xrick/include/config.h
  *

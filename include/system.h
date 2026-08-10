@@ -1,5 +1,3 @@
-// A MOIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
-
 /*
  * xrick/include/system.h
  *

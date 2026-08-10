@@ -26,6 +26,9 @@
 #include "tiles_render.h"
 #include "mapdata.h"
 #include "mapfile.h"
+#include "xrick_patch.h"
+#include "xrick_levels.h"
+#include "xrick_marks.h"
 
 namespace fs = std::filesystem;
 
@@ -73,15 +76,27 @@ struct EditorState
     bool dirty = false;        // unsaved changes
     int lastPaintCol = -1, lastPaintRow = -1;
     fs::path currentPath;      // empty if the map was never saved/loaded
+
+    // Sprites
+    bool showSprites = true;       // overlay toggle -- can be turned off to focus on tile editing
+    bool spritePlacementMode = false; // when on, canvas clicks place/remove sprites instead of tiles
+    int selectedEnt = 4;           // entity type id to place (lowest observed in stock data)
+    int hoverMarkSubmap = -1, hoverMarkIndex = -1; // nearest sprite under cursor, for right-click removal
 };
+
+enum class DialogPurpose { OpenMap, SaveMap, PickXrickBinary, PickXrickBinaryForConnections };
 
 struct FileDialog
 {
     bool show = false;
     bool saveMode = false;
+    DialogPurpose purpose = DialogPurpose::OpenMap;
     fs::path dir = fs::current_path();
     char filename[256] = "";
     std::string error;
+    // Empty = show every regular file; otherwise only files whose
+    // extension matches one of these (case-sensitive, includes the dot).
+    std::vector<std::string> extFilter = {".map"};
 };
 
 static void clampCamera(EditorState &st, int viewportW, int viewportH)
@@ -119,6 +134,62 @@ static void screenToCell(const EditorState &st, float sx, float sy, int &col, in
 static bool cellValid(int col, int row)
 {
     return col >= 0 && col < MAP_COLS && row >= 0 && row < MAP_ROWS;
+}
+
+// Screen-connection and sprite rows use TILE-row units, four times finer
+// than the main map's block-row grid (see the unit note in
+// xrick_levels.h) -- so their valid absolute range is MAP_ROWS*4, not
+// MAP_ROWS.
+static const int MAP_TILE_ROWS = MAP_ROWS * 4;
+
+// Absolute tile column (0-31, shared across the whole map -- unlike rows,
+// columns aren't submap-relative in the original format) under a screen
+// position.
+static int screenToTileCol(const EditorState &st, float sx)
+{
+    float worldX = st.cam.x + sx / st.cam.zoom;
+    return (int)std::floor(worldX / TILE_PX);
+}
+
+// Absolute tile row under a screen position -- same TILE_PX-based scale
+// as columns, and the unit screen-connections/sprites are stored in.
+static int screenToTileRow(const EditorState &st, float sy)
+{
+    float worldY = st.cam.y + sy / st.cam.zoom;
+    return (int)std::floor(worldY / TILE_PX);
+}
+
+// Which submap "owns" a given absolute tile row: the one whose own start
+// row is the closest at-or-below `rowAbs`, among all submaps. Used to
+// file a newly-placed sprite under the right submap's list.
+static int submapForAbsRow(const ConnectionsData &conn, int rowAbs)
+{
+    int best = -1, bestStart = -1;
+    for (int s = 0; s < MAP_NBR_SUBMAPS; s++)
+    {
+        int start = submapStartRow(conn.submaps[s]);
+        if (start <= rowAbs && start > bestStart) { bestStart = start; best = s; }
+    }
+    return best;
+}
+
+// Nearest sprite to (col, rowAbs) within a small radius, searched across
+// every submap. Used for right-click removal in sprite placement mode.
+static bool findMarkNear(const MarksData &marks, int col, int rowAbs, int &outSubmap, int &outIndex)
+{
+    const int RADIUS = 4; // tile columns / tile rows
+    int best = 1 << 30;
+    outSubmap = -1; outIndex = -1;
+    for (int s = 0; s < MAP_NBR_SUBMAPS; s++)
+    {
+        for (int i = 0; i < (int)marks.marks[s].size(); i++)
+        {
+            const MarkEntry &m = marks.marks[s][i];
+            int d = std::abs(m.col - col) + std::abs(m.rowAbs - rowAbs);
+            if (d < best) { best = d; outSubmap = s; outIndex = i; }
+        }
+    }
+    return best <= RADIUS;
 }
 
 static void drawMap(SDL_Renderer* renderer, SDL_Texture* blockAtlas, const EditorState &st, int viewportW, int viewportH)
@@ -207,7 +278,9 @@ static void updateWindowTitle(SDL_Window* window, const EditorState &st)
 static bool renderFileDialog(FileDialog &fd, fs::path &outPath)
 {
     if (!fd.show) return false;
-    const char* title = fd.saveMode ? "Save As" : "Open Map";
+    const char* title = fd.purpose == DialogPurpose::PickXrickBinary ? "Select xrick binary"
+                       : fd.purpose == DialogPurpose::PickXrickBinaryForConnections ? "Select xrick binary"
+                       : fd.saveMode ? "Save As" : "Open Map";
     ImGui::OpenPopup(title);
 
     bool confirmed = false;
@@ -232,7 +305,13 @@ static bool renderFileDialog(FileDialog &fd, fs::path &outPath)
             {
                 if (ec) break;
                 if (e.is_directory()) dirs.push_back(e);
-                else if (e.path().extension() == ".map") files.push_back(e);
+                else if (fd.extFilter.empty()) files.push_back(e);
+                else
+                {
+                    std::string ext = e.path().extension().string();
+                    if (std::find(fd.extFilter.begin(), fd.extFilter.end(), ext) != fd.extFilter.end())
+                        files.push_back(e);
+                }
             }
             std::sort(dirs.begin(), dirs.end(), [](auto&a, auto&b){ return a.path().filename() < b.path().filename(); });
             std::sort(files.begin(), files.end(), [](auto&a, auto&b){ return a.path().filename() < b.path().filename(); });
@@ -260,7 +339,10 @@ static bool renderFileDialog(FileDialog &fd, fs::path &outPath)
         if (!fd.error.empty())
             ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", fd.error.c_str());
 
-        if (ImGui::Button(fd.saveMode ? "Save" : "Open", ImVec2(120, 0)))
+        const char* confirmLabel = fd.purpose == DialogPurpose::PickXrickBinary ? "Select"
+                                  : fd.purpose == DialogPurpose::PickXrickBinaryForConnections ? "Select"
+                                  : fd.saveMode ? "Save" : "Open";
+        if (ImGui::Button(confirmLabel, ImVec2(120, 0)))
         {
             std::string name = fd.filename;
             if (name.empty())
@@ -301,20 +383,22 @@ static bool renderFileDialog(FileDialog &fd, fs::path &outPath)
 
 static void requestOpen(FileDialog &fd)
 {
-    fd.show = true; fd.saveMode = false; fd.filename[0] = '\0'; fd.error.clear();
+    fd.show = true; fd.saveMode = false; fd.purpose = DialogPurpose::OpenMap;
+    fd.extFilter = {".map"}; fd.filename[0] = '\0'; fd.error.clear();
 }
 static void requestSaveAs(FileDialog &fd, const fs::path &currentPath)
 {
-    fd.show = true; fd.saveMode = true; fd.filename[0] = '\0';
+    fd.show = true; fd.saveMode = true; fd.purpose = DialogPurpose::SaveMap;
+    fd.extFilter = {".map"}; fd.filename[0] = '\0';
     if (!currentPath.empty())
         std::snprintf(fd.filename, sizeof(fd.filename), "%s", currentPath.filename().string().c_str());
     fd.error.clear();
 }
-static void doSave(EditorState &st, FileDialog &fd)
+static void doSave(EditorState &st, FileDialog &fd, const ConnectionsData &conn, const MarksData &sprites)
 {
     if (st.currentPath.empty()) { requestSaveAs(fd, st.currentPath); return; }
     std::string err;
-    if (saveMapFile(st.currentPath, err)) st.dirty = false;
+    if (saveMapFileWithSprites(st.currentPath, conn, sprites, err)) st.dirty = false;
 }
 
 int main(int argc, char *argv[])
@@ -349,6 +433,10 @@ int main(int argc, char *argv[])
 
     EditorState st;
     FileDialog fileDialog;
+    ConnectionsData connections = defaultConnections();
+    MarksData sprites = defaultMarks();
+    std::string patchResultMessage;
+    bool patchResultOk = false;
     updateWindowTitle(window, st);
     bool running = true;
 
@@ -377,6 +465,32 @@ int main(int argc, char *argv[])
                 {
                     int col, row;
                     screenToCell(st, (float)event.button.x, (float)event.button.y, col, row);
+
+                    if (st.spritePlacementMode)
+                    {
+                        int tileCol = std::clamp(screenToTileCol(st, (float)event.button.x), 0, 31);
+                        int tileRow = screenToTileRow(st, (float)event.button.y);
+                        if (event.button.button == SDL_BUTTON_LEFT)
+                        {
+                            int owner = submapForAbsRow(connections, tileRow);
+                            if (owner >= 0)
+                            {
+                                sprites.marks[owner].push_back(MarkEntry{tileRow, tileCol, 0, st.selectedEnt, 0, 0});
+                                st.dirty = true;
+                            }
+                        }
+                        else if (event.button.button == SDL_BUTTON_RIGHT)
+                        {
+                            int fs, fi;
+                            if (findMarkNear(sprites, tileCol, tileRow, fs, fi))
+                            {
+                                sprites.marks[fs].erase(sprites.marks[fs].begin() + fi);
+                                st.dirty = true;
+                            }
+                        }
+                        continue; // don't also run the tile-editing handlers below
+                    }
+
                     if (event.button.button == SDL_BUTTON_LEFT)
                     {
                         const Uint8* ks = SDL_GetKeyboardState(nullptr);
@@ -503,14 +617,34 @@ int main(int argc, char *argv[])
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
 
-        // --- Main menu bar (kept as a secondary access point) ---
+        // --- Main menu bar (the only File access point, as requested --
+        // no separate dockable window for it) ---
         if (ImGui::BeginMainMenuBar())
         {
             if (ImGui::BeginMenu("File"))
             {
                 if (ImGui::MenuItem("Open...", "Ctrl+O")) requestOpen(fileDialog);
-                if (ImGui::MenuItem("Save", "Ctrl+S")) doSave(st, fileDialog);
+                if (ImGui::MenuItem("Save", "Ctrl+S")) doSave(st, fileDialog, connections, sprites);
                 if (ImGui::MenuItem("Save As...")) requestSaveAs(fileDialog, st.currentPath);
+                ImGui::Separator();
+                if (ImGui::MenuItem("Patch xrick binary..."))
+                {
+                    fileDialog.show = true;
+                    fileDialog.saveMode = false;
+                    fileDialog.purpose = DialogPurpose::PickXrickBinary;
+                    fileDialog.extFilter.clear(); // xrick executables have no fixed extension
+                    fileDialog.filename[0] = '\0';
+                    fileDialog.error.clear();
+                }
+                if (ImGui::MenuItem("Import connections && sprites from xrick binary..."))
+                {
+                    fileDialog.show = true;
+                    fileDialog.saveMode = false;
+                    fileDialog.purpose = DialogPurpose::PickXrickBinaryForConnections;
+                    fileDialog.extFilter.clear();
+                    fileDialog.filename[0] = '\0';
+                    fileDialog.error.clear();
+                }
                 ImGui::Separator();
                 if (ImGui::MenuItem("Quit")) running = false;
                 ImGui::EndMenu();
@@ -524,34 +658,52 @@ int main(int argc, char *argv[])
         if (renderFileDialog(fileDialog, chosenPath))
         {
             std::string err;
-            if (fileDialog.saveMode)
+            switch (fileDialog.purpose)
             {
-                if (saveMapFile(chosenPath, err)) { st.currentPath = chosenPath; st.dirty = false; }
-                else fileDialog.error = err;
-            }
-            else
-            {
-                if (loadMapFile(chosenPath, err)) { st.currentPath = chosenPath; st.dirty = false; st.sel.active = false; }
-                else fileDialog.error = err;
+                case DialogPurpose::SaveMap:
+                    if (saveMapFileWithSprites(chosenPath, connections, sprites, err)) { st.currentPath = chosenPath; st.dirty = false; }
+                    else fileDialog.error = err;
+                    break;
+                case DialogPurpose::OpenMap:
+                    if (loadMapFileWithSprites(chosenPath, connections, sprites, err)) { st.currentPath = chosenPath; st.dirty = false; st.sel.active = false; }
+                    else fileDialog.error = err;
+                    break;
+                case DialogPurpose::PickXrickBinary:
+                {
+                    PatchResult r = patchXrickBinaryWithSprites(chosenPath, connections, sprites);
+                    patchResultMessage = r.message;
+                    patchResultOk = r.ok;
+                    ImGui::OpenPopup("Result");
+                    break;
+                }
+                case DialogPurpose::PickXrickBinaryForConnections:
+                {
+                    std::string cerr;
+                    bool ok = loadXrickConnections(chosenPath, connections, cerr);
+                    if (ok) ok = loadXrickMarks(chosenPath, connections, sprites, cerr);
+                    patchResultMessage = ok
+                        ? "Imported " + std::to_string(MAP_NBR_SUBMAPS) + " submaps (connections + sprites) from "
+                          + chosenPath.filename().string() + ". See the \"Screen Connections\" and \"Sprite Tools\" windows."
+                        : cerr;
+                    patchResultOk = ok;
+                    ImGui::OpenPopup("Result");
+                    break;
+                }
             }
         }
 
-        // --- Dedicated File toolbox (separate window, same style as
-        // Block Palette / Tools -- easier to spot than the menu bar) ---
-        ImGui::SetNextWindowPos(ImVec2((float)viewportW / 2.0f - 150.0f, 34), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(300, 110), ImGuiCond_FirstUseEver);
-        ImGui::Begin("File");
-        if (ImGui::Button("Open...", ImVec2(90, 0))) requestOpen(fileDialog);
-        ImGui::SameLine();
-        if (ImGui::Button("Save", ImVec2(90, 0))) doSave(st, fileDialog);
-        ImGui::SameLine();
-        if (ImGui::Button("Save As...", ImVec2(90, 0))) requestSaveAs(fileDialog, st.currentPath);
-        ImGui::Separator();
-        if (st.currentPath.empty())
-            ImGui::TextDisabled("(new, unsaved map)");
-        else
-            ImGui::Text("%s%s", st.currentPath.filename().string().c_str(), st.dirty ? " *" : "");
-        ImGui::End();
+        if (ImGui::BeginPopupModal("Result", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+        {
+            ImGui::PushTextWrapPos(420.0f);
+            if (patchResultOk)
+                ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "%s", patchResultMessage.c_str());
+            else
+                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "%s", patchResultMessage.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::Separator();
+            if (ImGui::Button("OK", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
 
         // --- Block palette ---
         ImGui::SetNextWindowPos(ImVec2(10, 34), ImGuiCond_FirstUseEver);
@@ -606,6 +758,7 @@ int main(int argc, char *argv[])
                 ImGui::Text("Cell under cursor: col %d, row %d (index %d)", col, row, mapIndex(col, row));
             else
                 ImGui::Text("Cell under cursor: out of map");
+            ImGui::Text("Tile row under cursor: %d (Screen Connections / Sprite Tools use this)", screenToTileRow(st, (float)my));
         }
         ImGui::Separator();
         ImGui::TextWrapped("Left click: place selected block (hold to paint)");
@@ -623,7 +776,239 @@ int main(int argc, char *argv[])
         }
         ImGui::End();
 
-        updateWindowTitle(window, st);
+        // --- Screen Connections (links between submaps) ---
+        ImGui::SetNextWindowPos(ImVec2((float)viewportW - 380, 300), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(370, 500), ImGuiCond_FirstUseEver);
+        ImGui::Begin("Screen Connections");
+        {
+            int totalSlots = 0;
+            for (int i = 0; i < MAP_NBR_SUBMAPS; i++) totalSlots += (int)connections.exits[i].size() + 1;
+            bool full = totalSlots >= MAP_NBR_CONNECT;
+            ImGui::TextColored(full ? ImVec4(1.0f, 0.6f, 0.3f, 1.0f) : ImVec4(0.7f, 0.9f, 0.7f, 1.0f),
+                                "%d / %d exit slots used", totalSlots, MAP_NBR_CONNECT);
+            ImGui::TextWrapped("Rows are absolute TILE rows -- four times finer than the main map's "
+                                "block grid (\"Cell under cursor\" in Tools), so e.g. row 60 here lines "
+                                "up with block row 15 there. Confirmed from the original xrick source. "
+                                "A link is one row on this submap connected to one row on the target "
+                                "(direction just says which way through it counts as a trigger).");
+            ImGui::Separator();
+
+            int submapToDelete = -1;
+            for (int s = 0; s < MAP_NBR_SUBMAPS; s++)
+            {
+                ImGui::PushID(s);
+                char header[80];
+                std::snprintf(header, sizeof header, "Submap %d -- starts at row %d / block %d (%d links)",
+                              s, submapStartRow(connections.submaps[s]), submapStartRow(connections.submaps[s]) / 4,
+                              (int)connections.exits[s].size());
+                if (ImGui::CollapsingHeader(header))
+                {
+                    ImGui::Indent();
+
+                    int bank = connections.submaps[s].page == 1 ? 2 : 1;
+                    ImGui::SetNextItemWidth(90);
+                    if (ImGui::Combo("Tile bank", &bank, "1\0002\0\0")) connections.submaps[s].page = (bank == 2) ? 1 : 0;
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Delete (disconnect)"))
+                        ImGui::OpenPopup("confirm_delete_submap");
+                    if (ImGui::BeginPopup("confirm_delete_submap"))
+                    {
+                        ImGui::Text("This clears submap %d's own links and disconnects\n"
+                                     "any other submap's link that pointed to it.\n"
+                                     "Its tiles stay on the map, just unreachable.", s);
+                        if (ImGui::Button("Confirm")) { submapToDelete = s; ImGui::CloseCurrentPopup(); }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+                        ImGui::EndPopup();
+                    }
+
+                    auto &exits = connections.exits[s];
+                    int removeIdx = -1;
+                    for (int e = 0; e < (int)exits.size(); e++)
+                    {
+                        ImGui::PushID(e);
+                        ConnectEntry &c = exits[e];
+
+                        int base = submapStartRow(connections.submaps[s]);
+                        bool outOfRange = (c.rowAbs - base < 0 || c.rowAbs - base > 255);
+
+                        const char* dirLabels[] = { "Down", "Up" };
+                        ImGui::SetNextItemWidth(70);
+                        ImGui::Combo("##dir", &c.dir, dirLabels, 2);
+                        ImGui::SameLine();
+                        ImGui::TextUnformatted("row");
+                        ImGui::SameLine();
+                        ImGui::SetNextItemWidth(55);
+                        if (outOfRange) ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.5f, 0.15f, 0.15f, 1.0f));
+                        ImGui::DragInt("##rowabs", &c.rowAbs, 1.0f, 0, MAP_TILE_ROWS - 1);
+                        if (ImGui::IsItemHovered() && !outOfRange) ImGui::SetTooltip("Block row ~%d", c.rowAbs / 4);
+                        if (outOfRange) { ImGui::PopStyleColor(); if (ImGui::IsItemHovered()) ImGui::SetTooltip("Too far from this submap's own rows to fit the original format"); }
+                        ImGui::SameLine();
+                        ImGui::TextUnformatted("->");
+                        ImGui::SameLine();
+                        int target = c.targetSubmap == SUBMAP_END_OF_LEVEL ? MAP_NBR_SUBMAPS : c.targetSubmap;
+                        ImGui::SetNextItemWidth(60);
+                        if (ImGui::DragInt("##target", &target, 1.0f, 0, MAP_NBR_SUBMAPS))
+                            c.targetSubmap = std::clamp(target, 0, MAP_NBR_SUBMAPS);
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%d = end of this world", MAP_NBR_SUBMAPS);
+                        if (c.targetSubmap >= MAP_NBR_SUBMAPS) c.targetSubmap = SUBMAP_END_OF_LEVEL;
+
+                        if (c.targetSubmap != SUBMAP_END_OF_LEVEL)
+                        {
+                            ImGui::SameLine();
+                            ImGui::TextUnformatted("row");
+                            ImGui::SameLine();
+                            int tbase = submapStartRow(connections.submaps[c.targetSubmap]);
+                            bool targetOutOfRange = (c.targetRowAbs - tbase < 0 || c.targetRowAbs - tbase > 255);
+                            ImGui::SetNextItemWidth(55);
+                            if (targetOutOfRange) ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.5f, 0.15f, 0.15f, 1.0f));
+                            ImGui::DragInt("##targetrowabs", &c.targetRowAbs, 1.0f, 0, MAP_TILE_ROWS - 1);
+                            if (ImGui::IsItemHovered() && !targetOutOfRange) ImGui::SetTooltip("Block row ~%d", c.targetRowAbs / 4);
+                            if (targetOutOfRange) { ImGui::PopStyleColor(); if (ImGui::IsItemHovered()) ImGui::SetTooltip("Too far from submap %d's own rows to fit the original format", c.targetSubmap); }
+                        }
+                        else
+                        {
+                            ImGui::SameLine();
+                            ImGui::TextDisabled("(end of world)");
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("X")) removeIdx = e;
+                        ImGui::PopID();
+                    }
+                    if (removeIdx >= 0) exits.erase(exits.begin() + removeIdx);
+
+                    if (ImGui::SmallButton(full ? "+ Add link (table full)" : "+ Add link"))
+                    {
+                        if (!full)
+                        {
+                            int base = submapStartRow(connections.submaps[s]);
+                            exits.push_back(ConnectEntry{0, base, SUBMAP_END_OF_LEVEL, 0});
+                        }
+                    }
+                    ImGui::Unindent();
+                }
+                ImGui::PopID();
+            }
+            if (submapToDelete >= 0)
+            {
+                int redirected = disconnectSubmap(connections, submapToDelete);
+                patchResultMessage = "Submap " + std::to_string(submapToDelete) + " disconnected"
+                                    + (redirected > 0 ? " (" + std::to_string(redirected) + " incoming link(s) redirected to end-of-world)." : ".");
+                patchResultOk = true;
+                ImGui::OpenPopup("Result");
+            }
+        }
+        ImGui::End();
+
+        // --- Sprite Tools ---
+        ImGui::SetNextWindowPos(ImVec2(10, 600), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(360, 320), ImGuiCond_FirstUseEver);
+        ImGui::Begin("Sprite Tools");
+        ImGui::Checkbox("Show sprites on map", &st.showSprites);
+        ImGui::Checkbox("Sprite placement mode", &st.spritePlacementMode);
+        ImGui::TextWrapped(st.spritePlacementMode
+            ? "Left click: place the selected entity. Right click: remove the nearest sprite."
+            : "Off: canvas clicks edit tiles as usual. Turn this on to place/remove sprites instead.");
+        ImGui::Separator();
+        ImGui::SetNextItemWidth(100);
+        ImGui::DragInt("Entity type", &st.selectedEnt, 1.0f, 0, 255);
+        {
+            // Quick-pick chips for entity ids already used elsewhere on the map.
+            std::vector<int> seen;
+            for (int s = 0; s < MAP_NBR_SUBMAPS; s++)
+                for (auto &m : sprites.marks[s])
+                    if (std::find(seen.begin(), seen.end(), m.ent) == seen.end()) seen.push_back(m.ent);
+            std::sort(seen.begin(), seen.end());
+            ImGui::TextDisabled("Used on this map:");
+            for (int e : seen)
+            {
+                ImGui::SameLine();
+                ImGui::PushID(e);
+                char label[16]; std::snprintf(label, sizeof label, "%d", e);
+                if (ImGui::SmallButton(label)) st.selectedEnt = e;
+                ImGui::PopID();
+            }
+        }
+        ImGui::Separator();
+
+        int totalMarkSlots = 0;
+        for (int i = 0; i < MAP_NBR_SUBMAPS; i++) totalMarkSlots += (int)sprites.marks[i].size() + 1;
+        bool marksFull = totalMarkSlots >= MAP_NBR_MARKS;
+        ImGui::TextColored(marksFull ? ImVec4(1.0f, 0.6f, 0.3f, 1.0f) : ImVec4(0.7f, 0.9f, 0.7f, 1.0f),
+                            "%d / %d sprite slots used", totalMarkSlots, MAP_NBR_MARKS);
+        ImGui::TextWrapped("Rows are absolute TILE rows, like Screen Connections (four times finer "
+                            "than the main map's block grid). Column is a tile position "
+                            "(0-31) shared across the whole map width.");
+        ImGui::Separator();
+
+        for (int s = 0; s < MAP_NBR_SUBMAPS; s++)
+        {
+            if (sprites.marks[s].empty()) continue;
+            ImGui::PushID(1000 + s);
+            char header[64];
+            std::snprintf(header, sizeof header, "Submap %d (%d sprites)", s, (int)sprites.marks[s].size());
+            if (ImGui::CollapsingHeader(header))
+            {
+                ImGui::Indent();
+                auto &list = sprites.marks[s];
+                int removeIdx = -1;
+                for (int i = 0; i < (int)list.size(); i++)
+                {
+                    ImGui::PushID(i);
+                    MarkEntry &m = list[i];
+                    ImGui::SetNextItemWidth(55);
+                    ImGui::DragInt("##ent", &m.ent, 1.0f, 0, 255);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Entity type");
+                    ImGui::SameLine();
+                    ImGui::TextUnformatted("row");
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(55);
+                    ImGui::DragInt("##markrow", &m.rowAbs, 1.0f, 0, MAP_TILE_ROWS - 1);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Block row ~%d", m.rowAbs / 4);
+                    ImGui::SameLine();
+                    ImGui::TextUnformatted("col");
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(45);
+                    ImGui::DragInt("##markcol", &m.col, 1.0f, 0, 31);
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("X")) removeIdx = i;
+                    ImGui::PopID();
+                }
+                if (removeIdx >= 0) list.erase(list.begin() + removeIdx);
+                ImGui::Unindent();
+            }
+            ImGui::PopID();
+        }
+        ImGui::End();
+
+        // Sprite overlay on the map canvas: small colored markers with the
+        // entity id, drawn on top of the tiles (ImGui foreground draw list,
+        // so it layers above the SDL-rendered map but is unaffected by any
+        // particular window).
+        if (st.showSprites)
+        {
+            ImDrawList *dl = ImGui::GetForegroundDrawList();
+            for (int s = 0; s < MAP_NBR_SUBMAPS; s++)
+            {
+                for (auto &m : sprites.marks[s])
+                {
+                    float wx = m.col * (float)TILE_PX;
+                    float wy = m.rowAbs * (float)TILE_PX + m.fineY;
+                    float sx = (wx - st.cam.x) * st.cam.zoom;
+                    float sy = (wy - st.cam.y) * st.cam.zoom;
+                    if (sx < -20 || sy < -20 || sx > viewportW + 20 || sy > viewportH + 20) continue;
+                    float r = std::clamp(4.0f * st.cam.zoom, 3.0f, 10.0f);
+                    ImU32 col = IM_COL32(255, 210, 60, 230);
+                    dl->AddCircleFilled(ImVec2(sx, sy), r, col);
+                    dl->AddCircle(ImVec2(sx, sy), r, IM_COL32(60, 40, 0, 255), 0, 1.5f);
+                    if (st.cam.zoom >= 1.5f)
+                    {
+                        char lbl[8]; std::snprintf(lbl, sizeof lbl, "%d", m.ent);
+                        dl->AddText(ImVec2(sx + r + 2, sy - 7), IM_COL32(255, 255, 255, 255), lbl);
+                    }
+                }
+            }
+        }
 
         // --- Render ---
         SDL_SetRenderDrawColor(renderer, 20, 20, 24, 255);

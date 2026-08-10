@@ -81,3 +81,15 @@ commentées qui tracent l'historique d'édition du niveau).
 `main.h`, qui réservait une 4ᵉ banque jamais initialisée (donnée
 « fantôme »), a été retirée ; `mapdata.h` ne contient plus que la palette,
 `map_bnums` et `map_blocks`, strictement inchangés.
+
+## Remise à zéro de la carte (données stock)
+
+`map_bnums` a été régénéré à partir des données stock extraites d'un
+binaire xrick (symbole ELF `map_bnums`, 8152 octets) : c'est la carte
+d'origine du jeu, sans aucune modification manuelle -- vérifié à 0 écart
+avec le binaire. `map_blocks` et `tiles_data` étaient déjà identiques au
+binaire (vérifié également), ils n'ont pas eu besoin d'être régénérés.
+
+Le commentaire de blague `A MOIIII...` a été retiré de tous les fichiers
+sources vendorisés (`dat_tilesST.c`, `config.h`, `system.h`, `rects.h`,
+`img.h`, `tiles.h`).

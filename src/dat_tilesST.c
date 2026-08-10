@@ -1,4 +1,3 @@
-//         A MOIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
 /*
  * xrick/data/dat_tiles.c
  *
