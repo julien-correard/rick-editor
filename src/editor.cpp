@@ -29,6 +29,7 @@
 #include "xrick_patch.h"
 #include "xrick_levels.h"
 #include "xrick_marks.h"
+#include "sprites_render.h"
 
 namespace fs = std::filesystem;
 
@@ -430,6 +431,7 @@ int main(int argc, char *argv[])
         tileAtlas[b] = build_tile_atlas(renderer, b);
         blockAtlas[b] = build_block_atlas(renderer, tileAtlas[b]);
     }
+    SDL_Texture* spriteAtlas = build_sprite_atlas(renderer);
 
     EditorState st;
     FileDialog fileDialog;
@@ -475,7 +477,7 @@ int main(int argc, char *argv[])
                             int owner = submapForAbsRow(connections, tileRow);
                             if (owner >= 0)
                             {
-                                sprites.marks[owner].push_back(MarkEntry{tileRow, tileCol, 0, st.selectedEnt, 0, 0});
+                                sprites.marks[owner].push_back(MarkEntry{tileRow, tileCol, 0, st.selectedEnt, 0, 0, 0});
                                 st.dirty = true;
                             }
                         }
@@ -567,6 +569,9 @@ int main(int argc, char *argv[])
                         break;
                     case SDLK_f:
                         clearSelection(st, st.selectedBlock);
+                        break;
+                    case SDLK_s:
+                        if (!event.key.repeat) st.spritePlacementMode = !st.spritePlacementMode;
                         break;
                     case SDLK_1: st.bank = 1; break;
                     case SDLK_2: st.bank = 2; break;
@@ -920,12 +925,37 @@ int main(int argc, char *argv[])
                     if (std::find(seen.begin(), seen.end(), m.ent) == seen.end()) seen.push_back(m.ent);
             std::sort(seen.begin(), seen.end());
             ImGui::TextDisabled("Used on this map:");
-            for (int e : seen)
+            ImTextureID spriteTexIdQP = (ImTextureID)(intptr_t)spriteAtlas;
+            ImGuiStyle &qpStyle = ImGui::GetStyle();
+            float qpWindowRight = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
+            for (size_t qi = 0; qi < seen.size(); qi++)
             {
-                ImGui::SameLine();
+                int e = seen[qi];
                 ImGui::PushID(e);
-                char label[16]; std::snprintf(label, sizeof label, "%d", e);
-                if (ImGui::SmallButton(label)) st.selectedEnt = e;
+                int spr = (e >= 0 && e < (int)entDataTable.size()) ? entDataTable[e].spr : 0;
+                bool selected = (e == st.selectedEnt);
+                if (selected) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.55f, 0.95f, 1.0f));
+                if (spr > 0 && spr < SPRITES_NBR_SPRITES)
+                {
+                    float u0, v0, u1, v1;
+                    sprite_uv(spr, u0, v0, u1, v1);
+                    if (ImGui::ImageButton("##qp", spriteTexIdQP, ImVec2(24, 21), ImVec2(u0, v0), ImVec2(u1, v1)))
+                        st.selectedEnt = e;
+                }
+                else
+                {
+                    char label[16]; std::snprintf(label, sizeof label, "%d", e);
+                    if (ImGui::SmallButton(label)) st.selectedEnt = e;
+                }
+                if (selected) ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Entity %d", e);
+                // Wrap onto a new line once the next chip would overflow the
+                // window's content region, instead of forcing everything
+                // onto one never-ending row that clips the last entries.
+                float lastItemRight = ImGui::GetItemRectMax().x;
+                float nextItemRight = lastItemRight + qpStyle.ItemSpacing.x + ImGui::GetItemRectSize().x;
+                if (qi + 1 < seen.size() && nextItemRight < qpWindowRight)
+                    ImGui::SameLine();
                 ImGui::PopID();
             }
         }
@@ -956,22 +986,44 @@ int main(int argc, char *argv[])
                 {
                     ImGui::PushID(i);
                     MarkEntry &m = list[i];
-                    ImGui::SetNextItemWidth(55);
+                    ImGui::SetNextItemWidth(50);
                     ImGui::DragInt("##ent", &m.ent, 1.0f, 0, 255);
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Entity type");
                     ImGui::SameLine();
                     ImGui::TextUnformatted("row");
                     ImGui::SameLine();
-                    ImGui::SetNextItemWidth(55);
+                    ImGui::SetNextItemWidth(50);
                     ImGui::DragInt("##markrow", &m.rowAbs, 1.0f, 0, MAP_TILE_ROWS - 1);
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Block row ~%d", m.rowAbs / 4);
                     ImGui::SameLine();
+                    ImGui::TextUnformatted("+");
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(32);
+                    ImGui::DragInt("##fineY", &m.fineY, 0.2f, 0, 7);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Fine row offset (0-7, same weight as a whole row -- not pixels)");
+                    ImGui::SameLine();
                     ImGui::TextUnformatted("col");
                     ImGui::SameLine();
-                    ImGui::SetNextItemWidth(45);
+                    ImGui::SetNextItemWidth(40);
                     ImGui::DragInt("##markcol", &m.col, 1.0f, 0, 31);
                     ImGui::SameLine();
                     if (ImGui::SmallButton("X")) removeIdx = i;
+
+                    ImGui::TextDisabled("  trigger ->");
+                    ImGui::SameLine();
+                    ImGui::TextUnformatted("col");
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(40);
+                    ImGui::DragInt("##trigcol", &m.trigCol, 1.0f, 0, 31);
+                    ImGui::SameLine();
+                    ImGui::TextUnformatted("+row");
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(32);
+                    ImGui::DragInt("##trigrowoff", &m.trigRowOffset, 0.2f, 0, 7);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Where this entity's trigger reacts (e.g. an arrow trap's "
+                                           "firing spot), not its own drawn position. Only some entity "
+                                           "types use this -- inert otherwise.");
                     ImGui::PopID();
                 }
                 if (removeIdx >= 0) list.erase(list.begin() + removeIdx);
@@ -981,30 +1033,68 @@ int main(int argc, char *argv[])
         }
         ImGui::End();
 
-        // Sprite overlay on the map canvas: small colored markers with the
-        // entity id, drawn on top of the tiles (ImGui foreground draw list,
-        // so it layers above the SDL-rendered map but is unaffected by any
-        // particular window).
+        // Sprite overlay on the map canvas: real sprite art when available
+        // (ent_entdata's spr field, decoded from sprites_data -- see
+        // sprites_render.h), a colored marker fallback otherwise. Drawn on
+        // top of the tiles via SDL (so it can use the sprite atlas texture
+        // the same way the map itself does); the entity-id label and the
+        // trigger-point indicator use the ImGui foreground draw list.
         if (st.showSprites)
         {
             ImDrawList *dl = ImGui::GetForegroundDrawList();
+            ImTextureID spriteTexId = (ImTextureID)(intptr_t)spriteAtlas;
             for (int s = 0; s < MAP_NBR_SUBMAPS; s++)
             {
                 for (auto &m : sprites.marks[s])
                 {
+                    // Own position: (col, row+fineY) -- fineY is added at
+                    // the SAME weight as a whole row unit before the
+                    // engine's pixel conversion, not a small pixel nudge
+                    // (confirmed in ents.c). See markEffectiveRow().
                     float wx = m.col * (float)TILE_PX;
-                    float wy = m.rowAbs * (float)TILE_PX + m.fineY;
+                    float wy = markEffectiveRow(m) * (float)TILE_PX;
                     float sx = (wx - st.cam.x) * st.cam.zoom;
                     float sy = (wy - st.cam.y) * st.cam.zoom;
-                    if (sx < -20 || sy < -20 || sx > viewportW + 20 || sy > viewportH + 20) continue;
-                    float r = std::clamp(4.0f * st.cam.zoom, 3.0f, 10.0f);
-                    ImU32 col = IM_COL32(255, 210, 60, 230);
-                    dl->AddCircleFilled(ImVec2(sx, sy), r, col);
-                    dl->AddCircle(ImVec2(sx, sy), r, IM_COL32(60, 40, 0, 255), 0, 1.5f);
+                    if (sx < -60 || sy < -60 || sx > viewportW + 60 || sy > viewportH + 60) continue;
+
+                    int spr = (m.ent >= 0 && m.ent < (int)entDataTable.size()) ? entDataTable[m.ent].spr : 0;
+                    if (spr > 0 && spr < SPRITES_NBR_SPRITES)
+                    {
+                        float u0, v0, u1, v1;
+                        sprite_uv(spr, u0, v0, u1, v1);
+                        float w = SPRITE_W * st.cam.zoom, h = SPRITE_H * st.cam.zoom;
+                        dl->AddImage(spriteTexId, ImVec2(sx, sy), ImVec2(sx + w, sy + h), ImVec2(u0, v0), ImVec2(u1, v1));
+                    }
+                    else
+                    {
+                        float r = std::clamp(4.0f * st.cam.zoom, 3.0f, 10.0f);
+                        dl->AddCircleFilled(ImVec2(sx, sy), r, IM_COL32(255, 210, 60, 230));
+                        dl->AddCircle(ImVec2(sx, sy), r, IM_COL32(60, 40, 0, 255), 0, 1.5f);
+                    }
                     if (st.cam.zoom >= 1.5f)
                     {
                         char lbl[8]; std::snprintf(lbl, sizeof lbl, "%d", m.ent);
-                        dl->AddText(ImVec2(sx + r + 2, sy - 7), IM_COL32(255, 255, 255, 255), lbl);
+                        dl->AddText(ImVec2(sx + 2, sy - 12), IM_COL32(255, 255, 0, 255), lbl);
+                    }
+
+                    // Trigger point (decoded from the old `lt` byte -- see
+                    // MarkEntry's comment): some entity types (e.g. arrow
+                    // traps) react to Rick's position there rather than at
+                    // their own (col,row). Only drawn when it actually
+                    // differs from the entity's own spot, to avoid clutter
+                    // for entities that don't use it.
+                    int trigRow = markTriggerRow(m);
+                    if (m.trigCol != m.col || trigRow != m.rowAbs)
+                    {
+                        float twx = m.trigCol * (float)TILE_PX + TILE_PX / 2.0f;
+                        float twy = trigRow * (float)TILE_PX + TILE_PX / 2.0f;
+                        float tsx = (twx - st.cam.x) * st.cam.zoom;
+                        float tsy = (twy - st.cam.y) * st.cam.zoom;
+                        ImU32 trigCol = IM_COL32(255, 60, 60, 220);
+                        dl->AddLine(ImVec2(sx, sy), ImVec2(tsx, tsy), IM_COL32(255, 60, 60, 120), 1.5f);
+                        float cr = std::clamp(3.0f * st.cam.zoom, 3.0f, 8.0f);
+                        dl->AddLine(ImVec2(tsx - cr, tsy - cr), ImVec2(tsx + cr, tsy + cr), trigCol, 2.0f);
+                        dl->AddLine(ImVec2(tsx - cr, tsy + cr), ImVec2(tsx + cr, tsy - cr), trigCol, 2.0f);
                     }
                 }
             }
@@ -1029,6 +1119,7 @@ int main(int argc, char *argv[])
         SDL_DestroyTexture(blockAtlas[b]);
         SDL_DestroyTexture(tileAtlas[b]);
     }
+    SDL_DestroyTexture(spriteAtlas);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     SDL_Quit();

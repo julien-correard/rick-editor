@@ -51,10 +51,17 @@ struct MarkEntry
 {
     int rowAbs = 0;   // absolute row (this editor's coordinate space)
     int col = 0;      // tile column within the submap, 0-31
-    int fineY = 0;     // 0-7, bottom 3 bits of xy (best-effort, see file header)
+    int fineY = 0;     // 0-7, added to `row` (same scale, before the *8 -> pixel conversion) -- NOT a small pixel nudge, see decode below
     int ent = 4;       // entity/sprite type id
     int flags = 0;     // raw, not decoded (top bit = MAP_MARK_NACT)
-    int lt = 0;        // raw, not decoded
+    // Trigger point, decoded from `lt` (confirmed in ents.c, ent_reset()):
+    // some entity types (e.g. arrow traps) react to Rick's position near
+    // (trigCol, this-mark's-row + trigRowOffset) rather than their own
+    // (col, row) -- that's why e.g. an arrow trap's firing spot can look
+    // "off" from the trap's own drawn position: it's meant to be. Not
+    // every entity type uses this; for those that don't it's inert.
+    int trigCol = 0;      // 0-31, tile column of the trigger point
+    int trigRowOffset = 0; // 0-7, added to this mark's own row for the trigger's row
 };
 
 struct MarksData
@@ -65,6 +72,15 @@ struct MarksData
     std::vector<uint8_t> packedMarks;   // filled by repackMarks()
     std::vector<uint16_t> markStart;    // per-submap start offset, filled by repackMarks()
 };
+
+// Absolute pixel-scale row of a mark's OWN position (row + fineY, both
+// additive at the same scale before the engine's final *8 -> pixel step
+// -- confirmed in ents.c: `y = (xy&7) + (row&0xf8) - map_frow`). This is
+// NOT simply `rowAbs`: fineY contributes at the SAME weight as a whole
+// row unit, not a fraction of one.
+static inline int markEffectiveRow(const MarkEntry &m) { return m.rowAbs + m.fineY; }
+// Same for the trigger point (uses this mark's own row, per source).
+static inline int markTriggerRow(const MarkEntry &m) { return m.rowAbs + m.trigRowOffset; }
 
 inline MarksData decodeMarksFromRaw(const std::array<SubmapRaw, MAP_NBR_SUBMAPS> &rawSubmaps,
                                      const std::array<MarkRaw, MAP_NBR_MARKS> &rawMarks)
@@ -85,7 +101,8 @@ inline MarksData decodeMarksFromRaw(const std::array<SubmapRaw, MAP_NBR_SUBMAPS>
             e.fineY = r.xy & 0x7;
             e.ent = r.ent;
             e.flags = r.flags;
-            e.lt = r.lt;
+            e.trigCol = r.lt >> 3;
+            e.trigRowOffset = r.lt & 0x7;
             out.marks[i].push_back(e);
             c++;
         }
@@ -164,7 +181,8 @@ inline bool repackMarks(MarksData &data, const ConnectionsData &conn, std::strin
                 return false;
             }
             uint8_t xy = (uint8_t)(((e.col & 0x1f) << 3) | (e.fineY & 0x7));
-            flat.push_back(MarkRaw{(uint8_t)localRow, (uint8_t)e.ent, (uint8_t)e.flags, xy, (uint8_t)e.lt});
+            uint8_t lt = (uint8_t)(((e.trigCol & 0x1f) << 3) | (e.trigRowOffset & 0x7));
+            flat.push_back(MarkRaw{(uint8_t)localRow, (uint8_t)e.ent, (uint8_t)e.flags, xy, lt});
         }
         flat.push_back(MarkRaw{0xff, 0, 0, 0, 0}); // end-of-chain marker
     }
@@ -200,22 +218,24 @@ inline bool repackMarks(MarksData &data, const ConnectionsData &conn, std::strin
     return true;
 }
 
-// --- .map v3: level layout + screen connections + sprites -----------
+// --- .map v4: level layout + screen connections + sprites ------------
 //
-// Format ("RKM3" magic): same header/body as v2, followed by:
+// Format ("RKM4" magic): same header/body as v2, followed by:
 //   per submap (submapCount times):
 //     int32 markCount
-//     markCount * { int32 rowAbs, int32 col, int32 fineY, int32 ent, int32 flags, int32 lt }
+//     markCount * { int32 rowAbs, int32 col, int32 fineY, int32 ent, int32 flags, int32 trigCol, int32 trigRowOffset }
 //
-// Older "RKM2" (level + connections) and "RKMP" (level only) files still
-// open fine; missing parts are simply left as they currently are.
+// (v3/"RKM3" used a different, since-corrected sprite row/trigger encoding
+// -- not supported; re-save from that version's editor build if you still
+// have one.) Older "RKM2" (level + connections) and "RKMP" (level only)
+// files still open fine; missing parts are simply left as they currently are.
 struct MapFileHeaderV3 { char magic[4]; uint32_t bnumsCount; uint32_t submapCount; };
 
 inline bool saveMapFileWithSprites(const fs::path &path, const ConnectionsData &conn, const MarksData &marks, std::string &err)
 {
     FILE *f = std::fopen(path.string().c_str(), "wb");
     if (!f) { err = "Could not open file for writing"; return false; }
-    MapFileHeaderV3 hdr{{'R', 'K', 'M', '3'}, (uint32_t)MAP_COUNT, (uint32_t)MAP_NBR_SUBMAPS};
+    MapFileHeaderV3 hdr{{'R', 'K', 'M', '4'}, (uint32_t)MAP_COUNT, (uint32_t)MAP_NBR_SUBMAPS};
     bool ok = std::fwrite(&hdr, sizeof(hdr), 1, f) == 1
            && std::fwrite(map_bnums, sizeof(int), MAP_COUNT, f) == (size_t)MAP_COUNT;
     for (int i = 0; ok && i < MAP_NBR_SUBMAPS; i++)
@@ -236,8 +256,8 @@ inline bool saveMapFileWithSprites(const fs::path &path, const ConnectionsData &
         ok = ok && std::fwrite(&markCount, 4, 1, f) == 1;
         for (auto &m : marks.marks[i])
         {
-            int32_t vals[6] = {m.rowAbs, m.col, m.fineY, m.ent, m.flags, m.lt};
-            ok = ok && std::fwrite(vals, 4, 6, f) == 6;
+            int32_t vals[7] = {m.rowAbs, m.col, m.fineY, m.ent, m.flags, m.trigCol, m.trigRowOffset};
+            ok = ok && std::fwrite(vals, 4, 7, f) == 7;
         }
     }
     std::fclose(f);
@@ -246,7 +266,7 @@ inline bool saveMapFileWithSprites(const fs::path &path, const ConnectionsData &
 }
 
 // Loads a .map file into `conn` and `marks`. Handles all three format
-// generations (RKM3 / RKM2 / RKMP); parts absent from an older file are
+// generations (RKM4 / RKM2 / RKMP); parts absent from an older file are
 // left untouched (whatever `conn`/`marks` already held on entry).
 inline bool loadMapFileWithSprites(const fs::path &path, ConnectionsData &conn, MarksData &marks, std::string &err)
 {
@@ -256,7 +276,7 @@ inline bool loadMapFileWithSprites(const fs::path &path, ConnectionsData &conn, 
     probe.read(magic, 4);
     probe.close();
 
-    if (std::memcmp(magic, "RKM3", 4) != 0)
+    if (std::memcmp(magic, "RKM4", 4) != 0)
         return loadMapFileWithConnections(path, conn, err); // handles RKM2 and RKMP too
 
     FILE *f = std::fopen(path.string().c_str(), "rb");
@@ -297,9 +317,9 @@ inline bool loadMapFileWithSprites(const fs::path &path, ConnectionsData &conn, 
         loadedMarks.marks[i].clear();
         for (int m = 0; m < markCount && ok; m++)
         {
-            int32_t vals[6];
-            ok = std::fread(vals, 4, 6, f) == 6;
-            if (ok) loadedMarks.marks[i].push_back(MarkEntry{(int)vals[0], (int)vals[1], (int)vals[2], (int)vals[3], (int)vals[4], (int)vals[5]});
+            int32_t vals[7];
+            ok = std::fread(vals, 4, 7, f) == 7;
+            if (ok) loadedMarks.marks[i].push_back(MarkEntry{(int)vals[0], (int)vals[1], (int)vals[2], (int)vals[3], (int)vals[4], (int)vals[5], (int)vals[6]});
         }
     }
     std::fclose(f);

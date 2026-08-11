@@ -28,6 +28,7 @@ the original editor either) -- only banks 1 and 2 are selectable.
 | Middle-drag, or arrow keys Up/Down | Pan (fine, continuous) |
 | Left/Right, Page Up/Page Down | Fast scroll: jumps 20 cells per key press (repeats while held) |
 | `1` / `2` | Tile bank 1 / 2 |
+| `S` | Toggle sprite placement mode on/off |
 | Escape | Cancel the current selection |
 
 ## File menu (top menu bar only -- no separate dockable window)
@@ -253,3 +254,76 @@ Practical effects of the fix:
 Everything else already documented above (absolute rows, capacity
 limits, the caveat about `flags`/`lt`/fine-offset semantics) still
 applies -- only the row *scale* changed, not the overall model.
+
+## Sprite fixes and real sprite art (using the real xrick source)
+
+You provided the full xrick source (`rick.zip`) after noticing sprites
+looked wrong. Reading `ents.c` (`ent_reset()`) turned up two more issues,
+on top of the tile-row/block-row fix from before:
+
+**1. Sprites appearing shifted up.** The real Y formula is:
+
+    y = ((xy & 7) + (row & 0xf8) - map_frow) * 8
+
+`fineY` (`xy & 7`) is added to `row` **before** the final ×8, so it
+carries the *same weight as a whole row unit* (0-7 rows = 0-56 pixels),
+not a small 0-7 pixel nudge. 444 of the 476 stock sprites have a nonzero
+`fineY` (mostly 1 or 5) -- the editor was under-adding this offset for
+nearly all of them, hence the systematic upward shift (e.g. an enemy that
+should sit inside open space landing inside a solid block instead).
+Fixed: `markEffectiveRow(mark) = mark.rowAbs + mark.fineY` is now used
+everywhere a sprite's real vertical position is needed (rendering,
+placement), instead of scaling `fineY` as raw pixels.
+
+**2. Sprite 25 (arrow trap)'s firing position not matching its own
+placement -- this is by design, now made visible.** The `lt` byte (which
+the editor exposed as an opaque raw value) actually decodes into a
+**separate trigger point**:
+
+    trig_x = lt & 0xf8
+    trig_y = 3 + 8 * ((row & 0xf8) - map_frow + (lt & 0x07))
+
+Confirmed directly in `ents.c`. Some entity types (arrow traps among
+them) react to Rick's position at this *trigger* point rather than at
+their own drawn position -- e.g. a wall-mounted trap's firing plate can
+legitimately sit in a different column of the room. `MarkEntry` now
+exposes this as `trigCol` / `trigRowOffset` (editable in Sprite Tools,
+under each sprite's "trigger ->" row) instead of a raw `lt` byte, and the
+map overlay draws a small red crosshair with a connecting line from the
+entity to its trigger point whenever the two differ, so you can see (and
+fix) the relationship directly instead of guessing at a hex byte.
+Not every entity type consults this -- for those that don't it's inert,
+harmless data.
+
+**3. Real sprite art.** `dat_spritesST.c` (sprite pixel data) and the
+relevant part of `dat_ents.c` (entity-type -> sprite-index table) are now
+vendored into the project (`src/dat_spritesST.c`,
+`src/connections_default.h`'s `entDataTable`), decoded with the same
+nibble-per-pixel algorithm as tiles (confirmed against `draw.c`'s
+`draw_sprite()`), and built into a texture atlas
+(`src/sprites_render.h`). Placed entities now show their real first
+animation frame when one is defined for that entity type (`ent_entdata`'s
+`spr` field), falling back to the colored dot only for types with no
+distinct sprite (`spr == 0`). The quick-pick strip in Sprite Tools shows
+the same thumbnails.
+
+Because sprite rows/positions changed shape (`fineY` scale) and `lt`
+became two explicit fields, the `.map` format bumped to **v4**
+(`RKM4`); v1/v2/v3 files are handled the same way older formats always
+have been here -- whatever a given version doesn't include is simply
+left as-is when loading.
+
+Regression tests for both fixes (hand-checked against the raw bytes of a
+real mark) are in `test_xrick_marks.cpp`.
+
+### Still not attempted
+- Sprite *animation* (only the first frame is shown; `ent_sprseq` /
+  `ent_mvstep`, which drive frame sequencing, weren't decoded).
+- The exact bit meaning of the rest of `flags` (only `MAP_MARK_NACT`,
+  the top bit, is documented) -- still exposed raw, not decoded.
+- `ent_entdata`'s source table has 76 entries; this project's actual
+  xrick binary's `ent_entdata` symbol is sized for 74 -- a discrepancy
+  between the provided source and that specific compiled binary that
+  doesn't affect anything patched back into the binary (sprite art is a
+  purely local editor/rendering aid, never written back), but is worth
+  knowing about if the two are compared directly.

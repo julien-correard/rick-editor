@@ -26,7 +26,13 @@ target_include_directories(imgui PUBLIC
 add_executable(rickeditor
     src/editor.cpp
     src/dat_tilesST.c   # source de verite unique pour les tuiles graphiques
+    src/dat_spritesST.c # idem pour les sprites (entites/graphismes)
 )
+# dat_spritesST.c est vendorise tel quel depuis la source xrick d'origine ;
+# son style d'initialisation imbrique (accolades internes elidees) declenche
+# -Wmissing-braces de facon benigne -- on le silence pour ce seul fichier
+# plutot que de modifier les donnees vendorisees.
+set_source_files_properties(src/dat_spritesST.c PROPERTIES COMPILE_OPTIONS "-Wno-missing-braces")
 
 target_include_directories(rickeditor PRIVATE
     include

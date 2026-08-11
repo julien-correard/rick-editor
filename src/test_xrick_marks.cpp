@@ -7,7 +7,8 @@
 static bool sameMark(const MarkEntry &a, const MarkEntry &b)
 {
     return a.rowAbs == b.rowAbs && a.col == b.col && a.fineY == b.fineY
-        && a.ent == b.ent && a.flags == b.flags && a.lt == b.lt;
+        && a.ent == b.ent && a.flags == b.flags
+        && a.trigCol == b.trigCol && a.trigRowOffset == b.trigRowOffset;
 }
 
 int main(int argc, char** argv)
@@ -36,6 +37,37 @@ int main(int argc, char** argv)
     int total = 0;
     for (int i = 0; i < MAP_NBR_SUBMAPS; i++) total += (int)marks.marks[i].size();
     std::printf("Loaded %d sprites (+ %d end-markers = %d/%d slots)\n", total, MAP_NBR_SUBMAPS, total + MAP_NBR_SUBMAPS, MAP_NBR_MARKS);
+
+    // Regression guards for the two bugs found after reviewing the real
+    // xrick source (ents.c, ent_reset()):
+    //  1) fineY (xy&7) is added to `row` at the SAME weight before the
+    //     engine's final *8 -> pixel step, not as a 0-7 pixel nudge.
+    //     markEffectiveRow() must reflect that.
+    //  2) `lt` decodes into a separate trigger point (trigCol/trigRowOffset),
+    //     not a single opaque byte.
+    // Known-good values for submap 0's 2nd mark, hand-checked against the
+    // raw bytes: row=24, xy=1 (col=0, fineY=1), lt=40 (trigCol=5, trigRowOffset=0).
+    {
+        bool found = false;
+        for (auto &m : marks.marks[0])
+        {
+            if (m.rowAbs == 24 && m.col == 0 && m.ent == 42)
+            {
+                found = true;
+                if (m.fineY != 1 || m.trigCol != 5 || m.trigRowOffset != 0)
+                {
+                    std::printf("FAIL: decode regression -- fineY=%d (expected 1), trigCol=%d (expected 5), trigRowOffset=%d (expected 0)\n",
+                                 m.fineY, m.trigCol, m.trigRowOffset);
+                    return 1;
+                }
+                if (markEffectiveRow(m) != 25) { std::printf("FAIL: markEffectiveRow() = %d, expected 25\n", markEffectiveRow(m)); return 1; }
+                if (markTriggerRow(m) != 24) { std::printf("FAIL: markTriggerRow() = %d, expected 24\n", markTriggerRow(m)); return 1; }
+            }
+        }
+        if (!found) { std::printf("FAIL: could not find the reference mark (submap 0, row=24, ent=42) to check\n"); return 1; }
+        std::printf("OK: fineY and trigger-point decoding match the source-derived formulas exactly\n");
+    }
+
 
     // Matches the compiled-in defaults for a stock build.
     {
@@ -114,15 +146,15 @@ int main(int argc, char** argv)
         std::printf("OK: capacity check correctly refuses to overflow the %d-slot table (%s)\n", MAP_NBR_MARKS, capErr.c_str());
     }
 
-    // .map v3 round-trip (level + connections + sprites).
+    // .map v4 round-trip (level + connections + sprites).
     {
         fs::path tmp = fs::temp_directory_path() / "rickeditor_test_sprites.map";
         std::string ferr;
-        if (!saveMapFileWithSprites(tmp, conn, marks, ferr)) { std::printf("FAIL save .map v3: %s\n", ferr.c_str()); return 1; }
+        if (!saveMapFileWithSprites(tmp, conn, marks, ferr)) { std::printf("FAIL save .map v4: %s\n", ferr.c_str()); return 1; }
 
         ConnectionsData c3; MarksData m3;
         c3.loaded = true; m3.loaded = true;
-        if (!loadMapFileWithSprites(tmp, c3, m3, ferr)) { std::printf("FAIL load .map v3: %s\n", ferr.c_str()); return 1; }
+        if (!loadMapFileWithSprites(tmp, c3, m3, ferr)) { std::printf("FAIL load .map v4: %s\n", ferr.c_str()); return 1; }
         bool ok = true;
         for (int i = 0; i < MAP_NBR_SUBMAPS && ok; i++)
         {
@@ -131,8 +163,8 @@ int main(int argc, char** argv)
                 if (!sameMark(m3.marks[i][j], marks.marks[i][j])) { ok = false; break; }
         }
         std::remove(tmp.string().c_str());
-        if (!ok) { std::printf("FAIL: .map v3 sprite round-trip mismatch\n"); return 1; }
-        std::printf("OK: .map v3 (level + connections + sprites) round-trips exactly\n");
+        if (!ok) { std::printf("FAIL: .map v4 sprite round-trip mismatch\n"); return 1; }
+        std::printf("OK: .map v4 (level + connections + sprites) round-trips exactly\n");
     }
 
     return 0;
