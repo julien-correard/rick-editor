@@ -746,86 +746,94 @@ static const std::array<MarkRaw, 523> defaultMarksRaw = {{
   {255, 0, 0, 0, 0},
 }};
 
-// Entity type -> sprite index (first-frame art), from the real xrick
-// source's dat_ents.c (ent_entdata: w, h, spr -- sni/f5/f6/snd omitted,
-// not needed for rendering). spr==0 means no distinct sprite art is
+// Entity type -> sprite/step art data, from the real xrick source's
+// dat_ents.c (ent_entdata: w, h, spr, sni -- trig_w/trig_h/snd omitted,
+// not needed here). ENT_NBR_ENTDATA is 0x4a (74, valid ids 0-73) --
+// confirmed directly from ents.h; an earlier version of this table
+// mistakenly had 76 entries (misreading dat_ents.c's two commented-out
+// dead rows as live data), which gave entities 67/68 a bogus sprite
+// index and shifted every entity from 69 on by 2 -- both silently wrong
+// for several sprites actually used in the stock level (69-73, confirmed
+// against the real binary). spr==0 means no distinct sprite art is
 // defined for that entity type (falls back to a placeholder marker).
-struct EntData { int w, h, spr; };
-static const std::array<EntData, 76> entDataTable = {{
-  {0, 0, 0}, // ent 0
-  {24, 21, 0}, // ent 1
-  {0, 0, 0}, // ent 2
-  {24, 21, 0}, // ent 3
-  {24, 21, 47}, // ent 4
-  {24, 21, 47}, // ent 5
-  {24, 21, 47}, // ent 6
-  {24, 21, 55}, // ent 7
-  {24, 21, 55}, // ent 8
-  {24, 21, 55}, // ent 9
-  {24, 21, 65}, // ent 10
-  {24, 21, 65}, // ent 11
-  {24, 21, 65}, // ent 12
-  {24, 21, 75}, // ent 13
-  {24, 21, 75}, // ent 14
-  {24, 21, 75}, // ent 15
-  {24, 21, 41}, // ent 16
-  {24, 21, 42}, // ent 17
-  {24, 21, 43}, // ent 18
-  {24, 21, 44}, // ent 19
-  {24, 21, 46}, // ent 20
-  {24, 21, 45}, // ent 21
-  {24, 21, 30}, // ent 22
-  {24, 21, 31}, // ent 23
-  {24, 16, 12}, // ent 24
-  {24, 6, 14}, // ent 25
-  {24, 6, 14}, // ent 26
-  {24, 18, 17}, // ent 27
-  {24, 16, 12}, // ent 28
-  {24, 21, 20}, // ent 29
-  {24, 21, 20}, // ent 30
-  {24, 16, 12}, // ent 31
-  {4, 21, 24}, // ent 32
-  {24, 16, 12}, // ent 33
-  {16, 16, 27}, // ent 34
-  {16, 16, 30}, // ent 35
-  {24, 16, 12}, // ent 36
-  {32, 8, 32}, // ent 37
-  {24, 16, 12}, // ent 38
-  {32, 13, 35}, // ent 39
-  {24, 21, 38}, // ent 40
-  {24, 21, 38}, // ent 41
-  {24, 21, 44}, // ent 42
-  {24, 16, 48}, // ent 43
-  {32, 16, 8}, // ent 44
-  {24, 21, 10}, // ent 45
-  {24, 21, 54}, // ent 46
-  {24, 21, 57}, // ent 47
-  {32, 16, 8}, // ent 48
-  {24, 21, 10}, // ent 49
-  {18, 21, 60}, // ent 50
-  {18, 21, 65}, // ent 51
-  {24, 21, 10}, // ent 52
-  {24, 21, 70}, // ent 53
-  {18, 16, 75}, // ent 54
-  {18, 16, 79}, // ent 55
-  {24, 21, 83}, // ent 56
-  {16, 8, 87}, // ent 57
-  {24, 16, 90}, // ent 58
-  {24, 16, 92}, // ent 59
-  {24, 17, 104}, // ent 60
-  {18, 21, 60}, // ent 61
-  {24, 21, 106}, // ent 62
-  {32, 8, 117}, // ent 63
-  {24, 16, 109}, // ent 64
-  {24, 21, 119}, // ent 65
-  {24, 21, 70}, // ent 66
-  {24, 21, 65524}, // ent 67
-  {24, 21, 65524}, // ent 68
-  {24, 21, 128}, // ent 69
-  {24, 21, 128}, // ent 70
-  {24, 17, 104}, // ent 71
-  {24, 16, 90}, // ent 72
-  {18, 21, 60}, // ent 73
-  {32, 16, 8}, // ent 74
-  {24, 16, 12}, // ent 75
+// sni is step_no_i: normally an index into ent_mvstep for type-3 traps'
+// wake sequence, but reused as a raw sprite index (sprbase) for type
+// 1a/1b/2 entities when flags==0xF0 -- see ENT_FLG_MORPH_TO_TYPE2 in
+// xrick_marks.h.
+struct EntData { int w, h, spr, sni; };
+static const std::array<EntData, 74> entDataTable = {{
+  {0, 0, 0, 0}, // ent 0
+  {24, 21, 0, 0}, // ent 1
+  {0, 0, 0, 0}, // ent 2
+  {24, 21, 0, 0}, // ent 3
+  {24, 21, 47, 142}, // ent 4
+  {24, 21, 47, 142}, // ent 5
+  {24, 21, 47, 142}, // ent 6
+  {24, 21, 55, 126}, // ent 7
+  {24, 21, 55, 126}, // ent 8
+  {24, 21, 55, 126}, // ent 9
+  {24, 21, 65, 134}, // ent 10
+  {24, 21, 65, 134}, // ent 11
+  {24, 21, 65, 134}, // ent 12
+  {24, 21, 75, 134}, // ent 13
+  {24, 21, 75, 134}, // ent 14
+  {24, 21, 75, 134}, // ent 15
+  {24, 21, 41, 41}, // ent 16
+  {24, 21, 42, 42}, // ent 17
+  {24, 21, 43, 43}, // ent 18
+  {24, 21, 44, 44}, // ent 19
+  {24, 21, 46, 46}, // ent 20
+  {24, 21, 45, 45}, // ent 21
+  {24, 21, 30, 30}, // ent 22
+  {24, 21, 31, 31}, // ent 23
+  {24, 16, 12, 0}, // ent 24
+  {24, 6, 14, 5}, // ent 25
+  {24, 6, 14, 7}, // ent 26
+  {24, 18, 17, 9}, // ent 27
+  {24, 16, 12, 7}, // ent 28
+  {24, 21, 20, 164}, // ent 29
+  {24, 21, 20, 202}, // ent 30
+  {24, 16, 12, 13}, // ent 31
+  {4, 21, 24, 18}, // ent 32
+  {24, 16, 12, 20}, // ent 33
+  {16, 16, 27, 40}, // ent 34
+  {16, 16, 30, 42}, // ent 35
+  {24, 16, 12, 45}, // ent 36
+  {32, 8, 32, 9}, // ent 37
+  {24, 16, 12, 52}, // ent 38
+  {32, 13, 35, 9}, // ent 39
+  {24, 21, 38, 58}, // ent 40
+  {24, 21, 38, 60}, // ent 41
+  {24, 21, 44, 62}, // ent 42
+  {24, 16, 48, 72}, // ent 43
+  {32, 16, 8, 7}, // ent 44
+  {24, 21, 10, 76}, // ent 45
+  {24, 21, 54, 9}, // ent 46
+  {24, 21, 57, 83}, // ent 47
+  {32, 16, 8, 85}, // ent 48
+  {24, 21, 10, 97}, // ent 49
+  {18, 21, 60, 103}, // ent 50
+  {18, 21, 65, 106}, // ent 51
+  {24, 21, 10, 108}, // ent 52
+  {24, 21, 70, 113}, // ent 53
+  {18, 16, 75, 116}, // ent 54
+  {18, 16, 79, 116}, // ent 55
+  {24, 21, 83, 118}, // ent 56
+  {16, 8, 87, 7}, // ent 57
+  {24, 16, 90, 126}, // ent 58
+  {24, 16, 92, 9}, // ent 59
+  {24, 17, 104, 136}, // ent 60
+  {18, 21, 60, 142}, // ent 61
+  {24, 21, 106, 9}, // ent 62
+  {32, 8, 117, 144}, // ent 63
+  {24, 16, 109, 9}, // ent 64
+  {24, 21, 119, 18}, // ent 65
+  {24, 21, 70, 146}, // ent 66
+  {24, 21, 128, 148}, // ent 67
+  {24, 21, 128, 191}, // ent 68
+  {24, 17, 104, 229}, // ent 69
+  {24, 16, 90, 234}, // ent 70
+  {18, 21, 60, 244}, // ent 71
+  {32, 16, 8, 5}, // ent 72
+  {24, 16, 12, 5}, // ent 73
 }};

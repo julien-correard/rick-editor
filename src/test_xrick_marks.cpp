@@ -86,7 +86,8 @@ int main(int argc, char** argv)
     MarksData before = marks;
     ConnectionsData connCopy = conn;
     {
-        PatchResult r = patchXrickBinaryWithSprites(argv[1], connCopy, marks);
+        EflgData eflgT = defaultEflg();
+        PatchResult r = patchXrickBinaryWithSprites(argv[1], connCopy, marks, eflgT);
         if (!r.ok) { std::printf("FAIL no-op patch: %s\n", r.message.c_str()); return 1; }
         ConnectionsData reloadedConn;
         MarksData reloadedMarks;
@@ -113,12 +114,20 @@ int main(int argc, char** argv)
         for (int i = 0; i < MAP_NBR_SUBMAPS; i++) if (!m2.marks[i].empty()) { s = i; break; }
         if (s < 0) { std::printf("FAIL: no submap has any sprite to edit\n"); return 1; }
         MarkEntry edited = m2.marks[s][0];
-        edited.rowAbs += 1;
+        // +8 (not +1): the real engine's row grid only allows moving the
+        // shared coarse row in multiples of 8 tile-rows (see the "8-tile-row
+        // placement grid" investigation in EDITEUR.md) -- a +1 edit would
+        // get losslessly folded into fineY by repackMarks() instead of
+        // staying a literal rowAbs+1, which is correct real-engine
+        // behavior but would make this specific exact-field comparison
+        // fail for the wrong reason.
+        edited.rowAbs += 8;
         edited.col = (edited.col + 1) % 32;
         edited.ent = (edited.ent + 1) % 256;
         m2.marks[s][0] = edited;
 
-        PatchResult r = patchXrickBinaryWithSprites(argv[1], c2, m2);
+        EflgData eflgT2 = defaultEflg();
+        PatchResult r = patchXrickBinaryWithSprites(argv[1], c2, m2, eflgT2);
         std::printf("patch: ok=%d msg=%s\n", r.ok, r.message.c_str());
         if (!r.ok) return 1;
 
@@ -126,7 +135,14 @@ int main(int argc, char** argv)
         if (!loadXrickConnections(r.outputPath, rc, err)) { std::printf("FAIL reload: %s\n", err.c_str()); return 1; }
         if (!loadXrickMarks(r.outputPath, rc, rm, err)) { std::printf("FAIL reload marks: %s\n", err.c_str()); return 1; }
         std::remove(r.outputPath.string().c_str());
-        if (!sameMark(rm.marks[s][0], edited)) { std::printf("FAIL: edited sprite mismatch after patch+reload\n"); return 1; }
+        // repackMarks() now sorts each submap's marks by row (see the
+        // sorted-activation-order fix in EDITEUR.md) -- the edited mark's
+        // position within submap `s` may have shifted, so find it by its
+        // distinguishing edited fields rather than assuming it's still at
+        // index 0.
+        bool foundEdited = false;
+        for (auto &cand : rm.marks[s]) if (sameMark(cand, edited)) { foundEdited = true; break; }
+        if (!foundEdited) { std::printf("FAIL: edited sprite mismatch after patch+reload\n"); return 1; }
         for (int i = 0; i < MAP_NBR_SUBMAPS; i++)
         {
             size_t expected = m2.marks[i].size();
@@ -150,11 +166,11 @@ int main(int argc, char** argv)
     {
         fs::path tmp = fs::temp_directory_path() / "rickeditor_test_sprites.map";
         std::string ferr;
-        if (!saveMapFileWithSprites(tmp, conn, marks, ferr)) { std::printf("FAIL save .map v4: %s\n", ferr.c_str()); return 1; }
+        if (!saveMapFileWithSprites(tmp, conn, marks, defaultEflg(), ferr)) { std::printf("FAIL save .map v4: %s\n", ferr.c_str()); return 1; }
 
-        ConnectionsData c3; MarksData m3;
+        ConnectionsData c3; MarksData m3; EflgData eflgT3;
         c3.loaded = true; m3.loaded = true;
-        if (!loadMapFileWithSprites(tmp, c3, m3, ferr)) { std::printf("FAIL load .map v4: %s\n", ferr.c_str()); return 1; }
+        if (!loadMapFileWithSprites(tmp, c3, m3, eflgT3, ferr)) { std::printf("FAIL load .map v4: %s\n", ferr.c_str()); return 1; }
         bool ok = true;
         for (int i = 0; i < MAP_NBR_SUBMAPS && ok; i++)
         {
@@ -165,6 +181,33 @@ int main(int argc, char** argv)
         std::remove(tmp.string().c_str());
         if (!ok) { std::printf("FAIL: .map v4 sprite round-trip mismatch\n"); return 1; }
         std::printf("OK: .map v4 (level + connections + sprites) round-trips exactly\n");
+    }
+
+    // repackMarks() must sort each submap's marks by row before flattening:
+    // the real engine's activation scan (ents.c's ent_actvis()) is a
+    // forward-only linear scan that assumes ascending row and never
+    // backtracks -- a mark placed after others but with a LOWER row (e.g.
+    // clicked in an already-populated submap, appended at the end of the
+    // insertion-order vector) would otherwise permanently never spawn.
+    // Reproduces a real user report exactly: 3 sprites added after an
+    // existing higher-row one, ending up out of order.
+    {
+        ConnectionsData c5 = defaultConnections();
+        MarksData m5; // deliberately not defaultMarks() -- keep this isolated
+        int base = submapStartRow(c5.submaps[1]);
+        m5.marks[1].push_back(MarkEntry{base + 104, 22, 5, 4, 0xf0, 12, 1}); // pre-existing, higher row
+        m5.marks[1].push_back(MarkEntry{base + 32, 17, 5, 4, 0, 12, 0});     // placed after, lower row
+        m5.marks[1].push_back(MarkEntry{base + 40, 20, 5, 4, 0, 5, 0});
+        m5.marks[1].push_back(MarkEntry{base + 48, 19, 5, 4, 0, 14, 0});
+
+        std::string serr;
+        if (!repackMarks(m5, c5, serr)) { std::printf("FAIL: repackMarks on the sort-order test data: %s\n", serr.c_str()); return 1; }
+
+        bool sorted = true;
+        for (size_t i = 1; i < m5.marks[1].size(); i++)
+            if (m5.marks[1][i].rowAbs < m5.marks[1][i - 1].rowAbs) sorted = false;
+        if (!sorted) { std::printf("FAIL: repackMarks left submap 1's marks out of row order -- the real engine would silently drop some\n"); return 1; }
+        std::printf("OK: repackMarks sorts marks by row, so out-of-insertion-order placements still activate correctly\n");
     }
 
     return 0;

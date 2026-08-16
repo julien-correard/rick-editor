@@ -177,5 +177,46 @@ int main(int argc, char** argv)
         std::printf("OK: .map v2 (level + connections) round-trips exactly\n");
     }
 
+    // fixMisalignedBlockRun(): the real stock binary has a known quirk
+    // (submap 38 onward, block-row-misaligned bnums with a 2-block gap
+    // of genuinely unused padding right before the first one -- see
+    // EDITEUR.md). Verify the fix realigns everything, changes no
+    // mark/connection's absolute row, and doesn't alter what's actually
+    // displayed in-game (the real sliding-window block read).
+    {
+        ConnectionsData c4; std::string ferr;
+        if (!loadXrickConnections(argv[1], c4, ferr)) { std::printf("FAIL load for fix test: %s\n", ferr.c_str()); return 1; }
+
+        std::vector<std::pair<int, std::vector<int>>> windowsBefore;
+        for (int i = 0; i < MAP_NBR_SUBMAPS; i++)
+        {
+            std::vector<int> win;
+            for (int k = 0; k < 88; k++) win.push_back(map_bnums[c4.submaps[i].bnum + k]);
+            windowsBefore.push_back({i, win});
+        }
+
+        auto fix = fixMisalignedBlockRun(c4);
+        if (!fix.applied) { std::printf("FAIL: fixMisalignedBlockRun didn't apply on data known to need it: %s\n", fix.message.c_str()); return 1; }
+
+        bool allAligned = true;
+        for (int i = 0; i < MAP_NBR_SUBMAPS; i++) if (c4.submaps[i].bnum % 8 != 0) allAligned = false;
+        if (!allAligned) { std::printf("FAIL: some submap still misaligned after the fix\n"); return 1; }
+
+        bool windowsSame = true;
+        for (auto &[i, oldWin] : windowsBefore)
+        {
+            std::vector<int> newWin;
+            for (int k = 0; k < 88; k++) newWin.push_back(map_bnums[c4.submaps[i].bnum + k]);
+            if (oldWin != newWin) { windowsSame = false; break; }
+        }
+        if (!windowsSame) { std::printf("FAIL: some submap's real in-game block window changed after the fix\n"); return 1; }
+
+        auto fixAgain = fixMisalignedBlockRun(c4);
+        if (fixAgain.applied) { std::printf("FAIL: fix reported more work to do on already-fixed data\n"); return 1; }
+
+        std::printf("OK: fixMisalignedBlockRun realigns every affected submap to a clean block boundary, "
+                     "with the exact same in-game block window before and after, and is a no-op once fixed\n");
+    }
+
     return 0;
 }

@@ -125,6 +125,21 @@ inline std::vector<uint8_t> map_bnums_as_bytes()
     return out;
 }
 
+// map_blocks[256][16] is `int` in this editor's own in-memory copy (see
+// mapdata.h) for arithmetic convenience, but the real engine stores each
+// entry as a single byte (block_t = U8[16] in the original source,
+// xrick/include/maps.h -- confirmed against dat_maps.c's initializer,
+// every value 0x00-0xff) -- same "widened for the editor, packed back
+// down for the binary" pattern as map_bnums_as_bytes() above.
+inline std::vector<uint8_t> map_blocks_as_bytes()
+{
+    std::vector<uint8_t> out(0x100 * 16);
+    for (int b = 0; b < 0x100; b++)
+        for (int i = 0; i < 16; i++)
+            out[b * 16 + i] = (uint8_t)std::clamp(map_blocks[b][i], 0, 255);
+    return out;
+}
+
 struct PatchResult { bool ok = false; std::string message; fs::path outputPath; };
 
 // Patches a copy of xrickPath with the level currently in map_bnums[],

@@ -37,8 +37,15 @@ set_source_files_properties(src/dat_spritesST.c PROPERTIES COMPILE_OPTIONS "-Wno
 target_include_directories(rickeditor PRIVATE
     include
     src        # pour mapdata.h/tiles_render.h, a cote de editor.cpp
+    third_party # pour stb/stb_image.h (tile_import.h)
     ${SDL2_INCLUDE_DIRS}
 )
 
 target_link_libraries(rickeditor PRIVATE imgui ${SDL2_LIBRARIES})
 target_compile_options(rickeditor PRIVATE -Wall)
+# stb_image.h est vendorise tel quel (cf. src/tile_import.h) ; en usage
+# STB_IMAGE_STATIC, les nombreuses fonctions de son API qu'on n'appelle
+# pas declenchent -Wunused-function de facon benigne -- silence localise
+# a editor.cpp (seul fichier qui l'inclut avec STB_IMAGE_IMPLEMENTATION),
+# meme approche que pour dat_spritesST.c ci-dessus.
+set_source_files_properties(src/editor.cpp PROPERTIES COMPILE_OPTIONS "-Wno-unused-function")

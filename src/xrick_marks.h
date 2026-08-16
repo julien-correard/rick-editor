@@ -28,12 +28,28 @@
 //            vertical offset (`xy & 0x07`) added into the same row-scale
 //            sum as `row` before the final *8 -> pixel conversion the
 //            engine does at runtime. Confirmed against ents.c.
-//     flags: MAP_MARK_NACT (0x80) = "not active anymore" is the only
-//            documented bit; other bits are set in the stock data too
-//            (likely per-entity behavior flags) but aren't decoded here
-//            -- exposed as a raw byte.
+//     flags: per-entity behavior flags, confirmed against the real
+//            source (xrick/include/ents.h, xrick/src/e_them.c). NOT the
+//            same byte as MAP_MARK_NACT, which is a bit of `ent`
+//            (unrelated, not decoded here). Bits, from ents.h:
+//              0x01 ENT_FLG_ONCE       run once only (don't loop/respawn)
+//              0x02 ENT_FLG_STOPRICK   entity stops Rick (e.g. solid block)
+//              0x04 ENT_FLG_LETHALR    lethal when restarting a loop
+//              0x08 ENT_FLG_LETHALI    lethal from the moment it wakes up
+//              0x10 ENT_FLG_TRIGBOMB   wakes up when hit by a bomb
+//              0x20 ENT_FLG_TRIGBULLET wakes up when hit by a bullet
+//              0x40 ENT_FLG_TRIGSTOP   wakes up when Rick does his "stop" move
+//              0x80 ENT_FLG_TRIGRICK   wakes up when Rick walks into the trigger box
+//            The TRIG* bits only matter for "type 3" entities (ent id
+//            >= 0x18, see e_them_t3_action in e_them.c): those start
+//            asleep and NEVER wake up unless at least one TRIG* bit is
+//            set here -- e.g. a freshly-placed trap with flags=0 will
+//            never fire, no matter where its trigger point is.
 //     lt:    packed trigger info (trig_x / lat & trig_y), used by some
-//            trap-like entities. Not decoded -- exposed as a raw byte.
+//            trap-like entities. See ENT_FLG_TRIG* above for when it's
+//            actually consulted -- type "1a" walkers (see e_them.c)
+//            instead reuse trig_x as a patrol-distance counter, not a
+//            spatial trigger at all.
 #pragma once
 
 #include <array>
@@ -42,10 +58,50 @@
 #include <cstring>
 #include <cstdint>
 #include <fstream>
+#include <algorithm>
 
 #include "xrick_levels.h" // submapStartRow, ConnectionsData, elf32_* helpers, connections_default.h
+#include "xrick_eflg.h"   // EflgData, repackEflg -- patched alongside sprites/connections below
+#include "tiles.h"        // tile_t, tiles_data[][] -- persisted (banks 1/2) alongside eflg below
+#include "sprites.h"      // sprite_t, sprites_data[], SPRITES_NBR_SPRITES -- persisted below too
 
 static const int MAP_NBR_MARKS = 0x20B; // 523
+
+// Entity behavior flag bits (mark_t.flags) -- see the file header comment
+// above and xrick/include/ents.h / e_them.c for the authoritative source.
+static const int ENT_FLG_ONCE = 0x01;
+static const int ENT_FLG_STOPRICK = 0x02;
+static const int ENT_FLG_LETHALR = 0x04;
+static const int ENT_FLG_LETHALI = 0x08;
+static const int ENT_FLG_TRIGBOMB = 0x10;
+static const int ENT_FLG_TRIGBULLET = 0x20;
+static const int ENT_FLG_TRIGSTOP = 0x40;
+static const int ENT_FLG_TRIGRICK = 0x80;
+
+// Special case, confirmed in ents.c's entity-creation code
+// (ent_reset()): for a type 1a/1b/2 entity (ent id 4-15, i.e. one that
+// lands in the walker/climber slot pool, checked there as `e >= 0x09`
+// on the SLOT index, not the mark's own type id), having ALL FOUR
+// TRIG* bits set at once (flags == 0xF0 exactly) does something
+// unrelated to their usual "wake up a sleeping trap" meaning for type-3
+// entities: it makes `sprbase` -- normally the entity's own resting
+// sprite -- get overwritten with its OWN `sni` (step_no_i) field
+// instead, reinterpreted as a raw sprite index. sni is otherwise dead
+// data for these types (their movement logic never reads it -- only
+// type-3 traps' sleep/wake sequence does), so the original developers
+// repurposed it as a place to stash a DIFFERENT sprite to switch to.
+// The entity keeps rendering its own (type 1) sprite while airborne
+// (`sprite` is set separately from `sprbase` at creation, and only
+// recalculated from `sprbase` in e_them_t1_action2() on landing) --
+// so visually, a walker configured this way keeps its own look while
+// falling, then switches to whatever `sni` points at (typically
+// another entity type's `spr`) the instant it touches the ground.
+// The real xrick source itself calls this out as mysterious ("FIXME
+// what is this? ... Why? What is the point?") and references the
+// visible in-game example: "the falling guy on the right on submap 3:
+// it changes when hitting the ground." This is the "type 1 morphs
+// into type 2 on landing" mechanic.
+static const int ENT_FLG_MORPH_TO_TYPE2 = ENT_FLG_TRIGBOMB | ENT_FLG_TRIGBULLET | ENT_FLG_TRIGSTOP | ENT_FLG_TRIGRICK; // 0xF0
 
 struct MarkEntry
 {
@@ -81,6 +137,73 @@ struct MarksData
 static inline int markEffectiveRow(const MarkEntry &m) { return m.rowAbs + m.fineY; }
 // Same for the trigger point (uses this mark's own row, per source).
 static inline int markTriggerRow(const MarkEntry &m) { return m.rowAbs + m.trigRowOffset; }
+
+// The real engine masks the raw row byte with `& 0xf8` before using it,
+// for BOTH the entity's own y and its trigger's y (ents.c: `row & 0xf8`
+// appears in both formulas) -- so only every 8th LOCAL tile-row (relative
+// to the owning submap's own start row, not an absolute multiple) is a
+// legal coarse `rowAbs`. Any leftover is meant to live in `fineY` (for
+// the entity's own row) and `trigRowOffset` (for the trigger's row) --
+// both 0-7, neither masked away -- so effectively any pair of absolute
+// rows is still reachable, just not directly through `rowAbs` alone.
+// Placing or editing a mark whose (rowAbs - base) isn't a multiple of 8
+// will look fine in this editor's own preview (which doesn't replicate
+// the masking) but gets silently rounded DOWN -- i.e. shifted to an
+// EARLIER, physically HIGHER row on screen -- by the real, patched game
+// at runtime, for BOTH the entity and its trigger.
+//
+// snapMarkRowToBase() folds the constraint in losslessly by moving the
+// remainder into fineY *and* trigRowOffset together, so both the
+// entity's own effective row (rowAbs+fineY) and its trigger's effective
+// row (rowAbs+trigRowOffset) are preserved exactly. This must touch
+// both fields together: an earlier version of this fix only compensated
+// fineY, which kept the sprite's own drawn position correct but silently
+// dragged the trigger along with the coarse row shift, uncompensated --
+// exactly the "trap fires one block too high" bug this now avoids.
+// Tries rounding the coarse row down first, then up, whichever keeps
+// both resulting fine values in [0,7]; in the (very rare) case a mark's
+// own fineY and trigRowOffset straddle an 8-row boundary by the maximum
+// possible 7-row spread, perfect preservation of both isn't always
+// possible with a single shared coarse row -- when that happens this
+// keeps the entity's own row exact and clamps the trigger's.
+static inline int snapMarkRowToBase(int rowAbs, int base, int fineYOld, int trigRowOffsetOld,
+                                     int &fineYOut, int &trigRowOffsetOut)
+{
+    int local = rowAbs - base;
+    if (local < 0) local = 0;
+    int remFloor = local % 8;
+    int coarseFloor = local - remFloor;
+    int fineFloor = fineYOld + remFloor;
+    int trigFloor = trigRowOffsetOld + remFloor;
+    if (fineFloor <= 7 && trigFloor <= 7)
+    {
+        fineYOut = fineFloor;
+        trigRowOffsetOut = trigFloor;
+        return base + coarseFloor;
+    }
+    int coarseCeil = coarseFloor + 8;
+    int remCeil = remFloor - 8; // negative
+    int fineCeil = fineYOld + remCeil;
+    int trigCeil = trigRowOffsetOld + remCeil;
+    if (fineCeil >= 0 && trigCeil >= 0)
+    {
+        fineYOut = fineCeil;
+        trigRowOffsetOut = trigCeil;
+        return base + coarseCeil;
+    }
+    // Rare straddling case: keep the entity's own row exact, clamp the trigger.
+    fineYOut = std::clamp(fineFloor, 0, 7);
+    trigRowOffsetOut = std::clamp(trigFloor, 0, 7);
+    return base + coarseFloor;
+}
+// Convenience overload for call sites that only care about the entity's
+// own row (e.g. fresh placement, where trigRowOffset is still 0 and thus
+// trivially preserved by either branch above).
+static inline int snapMarkRowToBase(int rowAbs, int base, int &fineYOut)
+{
+    int trigDummy = 0, trigOut;
+    return snapMarkRowToBase(rowAbs, base, 0, trigDummy, fineYOut, trigOut);
+}
 
 inline MarksData decodeMarksFromRaw(const std::array<SubmapRaw, MAP_NBR_SUBMAPS> &rawSubmaps,
                                      const std::array<MarkRaw, MAP_NBR_MARKS> &rawMarks)
@@ -166,8 +289,41 @@ inline bool repackMarks(MarksData &data, const ConnectionsData &conn, std::strin
     for (int i = 0; i < MAP_NBR_SUBMAPS; i++)
     {
         int base = submapStartRow(conn.submaps[i]);
+        // The real engine's activation scan (ents.c's ent_actvis()) is a
+        // simple forward-only linear scan over each submap's mark chain
+        // that assumes ascending `row` and never backtracks (confirmed in
+        // the source: "go through the list ... marks being ordered by row
+        // number", with the scan index carried forward between calls).
+        // Freshly placed sprites get appended to the end of this list
+        // (insertion order), which is NOT necessarily row order once
+        // there's already a lower-row mark ahead of it -- an out-of-order
+        // entry can end up permanently skipped by that scan, never
+        // spawning at all. Sort by row (stable, so same-row entries keep
+        // their relative order) right before flattening to the raw
+        // format, so the file always matches what the real engine needs
+        // regardless of the order things were placed/edited in this
+        // editor.
+        std::stable_sort(data.marks[i].begin(), data.marks[i].end(),
+                          [](const MarkEntry &a, const MarkEntry &b) { return a.rowAbs < b.rowAbs; });
         for (auto &e : data.marks[i])
         {
+            // Defensive: the real engine only respects rows that are a
+            // multiple of 8 LOCAL tile-rows from the submap's start (see
+            // snapMarkRowToBase() above) -- fold any remainder into
+            // fineY *and* trigRowOffset together here, so a mark
+            // edited/placed off that grid (e.g. by older data, or a
+            // future UI bug) still ends up patched exactly where it
+            // visually sits in this editor -- both the entity's own row
+            // and its trigger's row -- instead of silently drifting once
+            // the real game masks the raw byte.
+            int newFineY, newTrigRowOffset;
+            int snappedRowAbs = snapMarkRowToBase(e.rowAbs, base, e.fineY, e.trigRowOffset, newFineY, newTrigRowOffset);
+            if (snappedRowAbs != e.rowAbs)
+            {
+                e.fineY = newFineY;
+                e.trigRowOffset = newTrigRowOffset;
+                e.rowAbs = snappedRowAbs;
+            }
             int localRow = e.rowAbs - base;
             if (localRow < 0 || localRow > 255)
             {
@@ -218,24 +374,52 @@ inline bool repackMarks(MarksData &data, const ConnectionsData &conn, std::strin
     return true;
 }
 
-// --- .map v4: level layout + screen connections + sprites ------------
+// --- .map v4/v5: level layout + screen connections + sprites (+ tile hazards) ---
 //
 // Format ("RKM4" magic): same header/body as v2, followed by:
 //   per submap (submapCount times):
 //     int32 markCount
 //     markCount * { int32 rowAbs, int32 col, int32 fineY, int32 ent, int32 flags, int32 trigCol, int32 trigRowOffset }
 //
+// Format ("RKM5" magic): same as RKM4, followed by:
+//   2 * 256 bytes: per-tile environment/hazard flags (bank 1, then bank 2 -- see xrick_eflg.h)
+//
+// Format ("RKM6" magic): same as RKM5, followed by:
+//   2 * 256 * sizeof(tile_t) bytes: tile GRAPHICS (bank 1, then bank 2 --
+//   see tile_import.h and the Tile Editor window), raw tiles_data[bank][]
+//   memory dump, same order/format as the compiled-in data. Bank 0
+//   (unused padding, never shown/edited) is deliberately not stored --
+//   nothing in the editor ever changes it, so re-deriving it from the
+//   compiled-in default on load is always correct.
+//
+// Format ("RKM7" magic): same as RKM6, followed by:
+//   0x100 * 16 * sizeof(int) bytes: map_blocks (which tile goes in each
+//   of the 16 cells of each of the 256 blocks -- see the Block Editor
+//   window), raw in-memory dump, same order/type as this editor's own
+//   `int map_blocks[0x100][16]` (mapdata.h). Shared by both tile banks
+//   (a block's tile *positions* don't depend on which bank's graphics
+//   are used to render it), so there's only one copy to store, unlike
+//   tile graphics/hazard flags above.
+//
+// Format ("RKM8" magic): same as RKM7, followed by:
+//   SPRITES_NBR_SPRITES * sizeof(sprite_t) bytes: sprite GRAPHICS (see
+//   sprite_import.h and the Sprite Editor window), raw sprites_data[]
+//   memory dump. One flat table, no bank split (unlike tiles).
+//
 // (v3/"RKM3" used a different, since-corrected sprite row/trigger encoding
 // -- not supported; re-save from that version's editor build if you still
 // have one.) Older "RKM2" (level + connections) and "RKMP" (level only)
-// files still open fine; missing parts are simply left as they currently are.
+// files still open fine; missing parts (including tile hazards from any
+// file older than RKM5, tile graphics from any file older than RKM6,
+// block composition from any file older than RKM7, and sprite graphics
+// from any file older than RKM8) are simply left as they currently are.
 struct MapFileHeaderV3 { char magic[4]; uint32_t bnumsCount; uint32_t submapCount; };
 
-inline bool saveMapFileWithSprites(const fs::path &path, const ConnectionsData &conn, const MarksData &marks, std::string &err)
+inline bool saveMapFileWithSprites(const fs::path &path, const ConnectionsData &conn, const MarksData &marks, const EflgData &eflg, std::string &err)
 {
     FILE *f = std::fopen(path.string().c_str(), "wb");
     if (!f) { err = "Could not open file for writing"; return false; }
-    MapFileHeaderV3 hdr{{'R', 'K', 'M', '4'}, (uint32_t)MAP_COUNT, (uint32_t)MAP_NBR_SUBMAPS};
+    MapFileHeaderV3 hdr{{'R', 'K', 'M', '8'}, (uint32_t)MAP_COUNT, (uint32_t)MAP_NBR_SUBMAPS};
     bool ok = std::fwrite(&hdr, sizeof(hdr), 1, f) == 1
            && std::fwrite(map_bnums, sizeof(int), MAP_COUNT, f) == (size_t)MAP_COUNT;
     for (int i = 0; ok && i < MAP_NBR_SUBMAPS; i++)
@@ -260,15 +444,21 @@ inline bool saveMapFileWithSprites(const fs::path &path, const ConnectionsData &
             ok = ok && std::fwrite(vals, 4, 7, f) == 7;
         }
     }
+    ok = ok && std::fwrite(eflg.bank[0].data(), 1, 256, f) == 256
+            && std::fwrite(eflg.bank[1].data(), 1, 256, f) == 256;
+    ok = ok && std::fwrite(tiles_data[1], sizeof(tile_t), 0x100, f) == 0x100
+            && std::fwrite(tiles_data[2], sizeof(tile_t), 0x100, f) == 0x100;
+    ok = ok && std::fwrite(map_blocks, sizeof(int), 0x100 * 16, f) == (size_t)(0x100 * 16);
+    ok = ok && std::fwrite(sprites_data, sizeof(sprite_t), SPRITES_NBR_SPRITES, f) == (size_t)SPRITES_NBR_SPRITES;
     std::fclose(f);
     if (!ok) { err = "Write error"; return false; }
     return true;
 }
 
-// Loads a .map file into `conn` and `marks`. Handles all three format
-// generations (RKM4 / RKM2 / RKMP); parts absent from an older file are
-// left untouched (whatever `conn`/`marks` already held on entry).
-inline bool loadMapFileWithSprites(const fs::path &path, ConnectionsData &conn, MarksData &marks, std::string &err)
+// Loads a .map file into `conn`, `marks`, and `eflg`. Handles all format
+// generations (RKM5 / RKM4 / RKM2 / RKMP); parts absent from an older
+// file are left untouched (whatever was passed in on entry).
+inline bool loadMapFileWithSprites(const fs::path &path, ConnectionsData &conn, MarksData &marks, EflgData &eflg, std::string &err)
 {
     std::ifstream probe(path, std::ios::binary);
     if (!probe) { err = "Could not open " + path.string(); return false; }
@@ -276,7 +466,11 @@ inline bool loadMapFileWithSprites(const fs::path &path, ConnectionsData &conn, 
     probe.read(magic, 4);
     probe.close();
 
-    if (std::memcmp(magic, "RKM4", 4) != 0)
+    bool hasSprites = std::memcmp(magic, "RKM8", 4) == 0;
+    bool hasBlocks = hasSprites || std::memcmp(magic, "RKM7", 4) == 0;
+    bool hasTiles = hasBlocks || std::memcmp(magic, "RKM6", 4) == 0;
+    bool hasEflg = hasTiles || std::memcmp(magic, "RKM5", 4) == 0;
+    if (!hasEflg && std::memcmp(magic, "RKM4", 4) != 0)
         return loadMapFileWithConnections(path, conn, err); // handles RKM2 and RKMP too
 
     FILE *f = std::fopen(path.string().c_str(), "rb");
@@ -322,15 +516,52 @@ inline bool loadMapFileWithSprites(const fs::path &path, ConnectionsData &conn, 
             if (ok) loadedMarks.marks[i].push_back(MarkEntry{(int)vals[0], (int)vals[1], (int)vals[2], (int)vals[3], (int)vals[4], (int)vals[5], (int)vals[6]});
         }
     }
+    if (!ok) { std::fclose(f); err = "Read error (sprites)"; return false; }
+
+    EflgData loadedEflg = eflg; // keep whatever was there if this file predates RKM5
+    if (hasEflg)
+    {
+        ok = std::fread(loadedEflg.bank[0].data(), 1, 256, f) == 256
+          && std::fread(loadedEflg.bank[1].data(), 1, 256, f) == 256;
+        if (!ok) { std::fclose(f); err = "Read error (tile hazard flags)"; return false; }
+    }
+    if (hasTiles)
+    {
+        // Bank 0 isn't stored (see the format comment above) -- only 1
+        // and 2 are ever read/written here. Read into the live global
+        // array directly (same convention as map_bnums above): the
+        // caller is responsible for rebuilding the tile/block atlas
+        // textures afterwards (needs the SDL renderer, not available
+        // in this header).
+        ok = std::fread(tiles_data[1], sizeof(tile_t), 0x100, f) == 0x100
+          && std::fread(tiles_data[2], sizeof(tile_t), 0x100, f) == 0x100;
+        if (!ok) { std::fclose(f); err = "Read error (tile graphics)"; return false; }
+    }
+    if (hasBlocks)
+    {
+        // Same direct-into-live-global convention as map_bnums and
+        // tiles_data above -- caller rebuilds the block atlas texture
+        // afterwards (needs the SDL renderer).
+        ok = std::fread(map_blocks, sizeof(int), 0x100 * 16, f) == (size_t)(0x100 * 16);
+        if (!ok) { std::fclose(f); err = "Read error (block composition)"; return false; }
+    }
+    if (hasSprites)
+    {
+        // Same direct-into-live-global convention as tiles_data/
+        // map_blocks above -- caller rebuilds the sprite atlas texture
+        // afterwards (needs the SDL renderer).
+        ok = std::fread(sprites_data, sizeof(sprite_t), SPRITES_NBR_SPRITES, f) == (size_t)SPRITES_NBR_SPRITES;
+        if (!ok) { std::fclose(f); err = "Read error (sprite graphics)"; return false; }
+    }
     std::fclose(f);
-    if (!ok) { err = "Read error (sprites)"; return false; }
 
     conn = loadedConn;
     marks = loadedMarks;
+    eflg = loadedEflg;
     return true;
 }
 
-inline PatchResult patchXrickBinaryWithSprites(const fs::path &xrickPath, ConnectionsData &conn, MarksData &marks)
+inline PatchResult patchXrickBinaryWithSprites(const fs::path &xrickPath, ConnectionsData &conn, MarksData &marks, const EflgData &eflg)
 {
     std::string err;
     if (!repackConnections(conn, err))
@@ -340,6 +571,11 @@ inline PatchResult patchXrickBinaryWithSprites(const fs::path &xrickPath, Connec
     if (!repackMarks(marks, conn, err))
     {
         PatchResult res; res.message = "Could not patch the sprites: " + err; return res;
+    }
+    uint8_t eflgPacked[MAP_NBR_EFLGC];
+    if (!repackEflg(eflg, eflgPacked, err))
+    {
+        PatchResult res; res.message = "Could not patch the tile hazard flags: " + err; return res;
     }
     // repackConnections() already wrote conn.packedSubmaps with its own
     // `connect` field recomputed; patch in the `mark` field too before
@@ -366,6 +602,15 @@ inline PatchResult patchXrickBinaryWithSprites(const fs::path &xrickPath, Connec
     { res.message = "Could not patch map_connect: " + err; return res; }
     if (!elf32_patch_symbol(buf, "map_marks", marks.packedMarks.data(), marks.packedMarks.size(), err))
     { res.message = "Could not patch map_marks: " + err; return res; }
+    if (!elf32_patch_symbol(buf, "map_eflg_c", eflgPacked, MAP_NBR_EFLGC, err))
+    { res.message = "Could not patch map_eflg_c (tile hazard flags): " + err; return res; }
+    if (!elf32_patch_symbol(buf, "tiles_data", tiles_data, sizeof(tiles_data), err))
+    { res.message = "Could not patch tiles_data (tile graphics): " + err; return res; }
+    std::vector<uint8_t> blocksBytes = map_blocks_as_bytes();
+    if (!elf32_patch_symbol(buf, "map_blocks", blocksBytes.data(), blocksBytes.size(), err))
+    { res.message = "Could not patch map_blocks (block composition): " + err; return res; }
+    if (!elf32_patch_symbol(buf, "sprites_data", sprites_data, sizeof(sprites_data), err))
+    { res.message = "Could not patch sprites_data (sprite graphics): " + err; return res; }
 
     fs::path outPath = xrickPath;
     outPath.replace_filename(xrickPath.stem().string() + "_patched" + xrickPath.extension().string());
@@ -379,6 +624,6 @@ inline PatchResult patchXrickBinaryWithSprites(const fs::path &xrickPath, Connec
 
     res.ok = true;
     res.outputPath = outPath;
-    res.message = "Patched level written to " + outPath.string() + " (level layout + screen connections + sprites)";
+    res.message = "Patched level written to " + outPath.string() + " (level layout + screen connections + sprites + tile hazard flags + tile graphics + block composition + sprite graphics)";
     return res;
 }

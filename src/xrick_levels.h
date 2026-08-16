@@ -41,6 +41,7 @@
 #include <cstring>
 #include <cstdint>
 #include <fstream>
+#include <algorithm>
 
 #include "xrick_patch.h" // elf32_find_symbol_file_offset, elf32_patch_symbol
 #include "connections_default.h"
@@ -267,6 +268,89 @@ inline int disconnectSubmap(ConnectionsData &data, int s)
         }
     }
     return redirected;
+}
+
+// One-off diagnostic + fix for a specific known quirk in the stock
+// data: starting at the first submap (by bnum) whose bnum isn't a
+// multiple of 8, a run of submaps have their block data packed
+// starting a few COLUMNS into a block-row instead of at its start
+// (bnum used as a flat, row-agnostic index into map_bnums -- confirmed
+// in maps.c's map_expand(): `map_bnums[pbnum]` with pbnum computed by
+// adding bnum directly, no /8 conversion, so it reads 8 consecutive
+// flat entries per screen-row regardless of which "row" they land in
+// under this editor's own fixed 8-column grid). Confirmed harmless for
+// actual gameplay (the real engine's flat/sliding-window read handles
+// it correctly either way) -- but it means this editor's own
+// block-row-aligned canvas rendering, and its "Submap N" boundary
+// labels, don't accurately represent where these submaps' content
+// really starts, which looks like "everything's shifted".
+//
+// This only touches the block DATA and each affected submap's own
+// `bnum` -- never any mark's or connection's absolute row (those are
+// untouched, so nothing visually moves in-game; only the block-grid
+// alignment changes) -- and only proceeds if the exact known-safe
+// precondition holds (the few blocks right before the misaligned
+// submap's start are genuinely unused, i.e. all zero): otherwise it
+// refuses and explains why, rather than guessing.
+struct BlockShiftFixResult { bool applied = false; std::string message; };
+
+inline BlockShiftFixResult fixMisalignedBlockRun(ConnectionsData &conn)
+{
+    BlockShiftFixResult res;
+    std::vector<int> order;
+    for (int i = 0; i < MAP_NBR_SUBMAPS; i++) order.push_back(i);
+    std::sort(order.begin(), order.end(), [&](int a, int b) { return conn.submaps[a].bnum < conn.submaps[b].bnum; });
+
+    int firstBad = -1;
+    for (int idx : order)
+        if (conn.submaps[idx].bnum % 8 != 0) { firstBad = idx; break; }
+    if (firstBad < 0) { res.message = "No misaligned submaps found -- nothing to fix."; return res; }
+
+    int bnum = conn.submaps[firstBad].bnum;
+    int residual = bnum % 8;
+    int gapStart = bnum - residual;
+    for (int i = gapStart; i < bnum; i++)
+    {
+        if (map_bnums[i] != 0)
+        {
+            res.message = "Submap " + std::to_string(firstBad) + " starts at a non-aligned block ("
+                + std::to_string(bnum) + "), but the " + std::to_string(residual)
+                + " block(s) right before it aren't empty (block " + std::to_string(i) + " = "
+                + std::to_string(map_bnums[i]) + ") -- refusing to shift, this doesn't match the "
+                  "one known-safe pattern this fix handles.";
+            return res;
+        }
+    }
+
+    std::vector<int> affected;
+    for (int idx : order) if (conn.submaps[idx].bnum >= bnum) affected.push_back(idx);
+    for (int idx : affected)
+    {
+        if (conn.submaps[idx].bnum % 8 != residual)
+        {
+            res.message = "Submap " + std::to_string(idx) + " (block " + std::to_string(conn.submaps[idx].bnum)
+                + ") doesn't share submap " + std::to_string(firstBad) + "'s offset -- refusing to shift, "
+                  "the run of affected submaps isn't as expected.";
+            return res;
+        }
+    }
+
+    int total = MAP_COUNT;
+    for (int i = gapStart; i < total - residual; i++)
+        map_bnums[i] = map_bnums[i + residual];
+    for (int i = total - residual; i < total; i++)
+        map_bnums[i] = 0;
+
+    for (int idx : affected)
+        conn.submaps[idx].bnum -= residual;
+
+    res.applied = true;
+    res.message = "Realigned " + std::to_string(affected.size()) + " submap(s) starting at submap "
+        + std::to_string(firstBad) + " (block " + std::to_string(bnum) + " -> " + std::to_string(gapStart)
+        + ") by absorbing " + std::to_string(residual) + " previously-unused padding block(s). "
+          "Nothing displayed in-game changes (marks/connections keep their own absolute rows) -- "
+          "only the block-grid alignment. Save/re-patch to keep this fix.";
+    return res;
 }
 
 // --- .map v2: level layout + screen connections in one file ---------
