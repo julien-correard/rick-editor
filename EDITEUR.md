@@ -24,6 +24,18 @@ quicker ways to reach the same things. There used to be a separate
 "Tools" window duplicating most of this; it's gone now that everything
 useful in it lives in the top bar instead.
 
+Only **File** is a true ImGui menu bar (needed for its dropdown); the
+row below it (canvas mode, editor toggles, Grid, zoom, Fill selection,
+cursor position) is a plain toolbar window instead, specifically so it
+can **wrap to a second line** if the window's too narrow to fit
+everything on one -- a real menu bar can't do that at all (items just
+run off the edge), which became a real problem once enough editor
+toggles piled up over time. Wrapping works item-by-item (`wrap()` in
+`editor.cpp`: tentatively place the next item on the same line, then
+bump it to a fresh line if that pushed past the right edge) rather than
+all-or-nothing, so it degrades gracefully at any width rather than
+snapping awkwardly between one full line and one mostly-empty one.
+
 The **Block Palette** window only shows up in Block mode, **Sprite
 Tools** only in Sprite mode, and **Screen Connections** only in Submap
 mode -- each is irrelevant clutter in the other two modes, so they get
@@ -57,17 +69,20 @@ Screen Connections.
   format (see `src/mapfile.h`/`src/xrick_marks.h`): a small header (magic
   + version + element count) followed by the 8152 `map_bnums` values,
   screen connections, sprites, per-tile hazard flags, tile graphics (as
-  of "RKM6"), block composition (as of "RKM7"), and sprite graphics (as
-  of "RKM8"). Loading refuses any file whose element count doesn't
-  match. A `*` next to the file name means there are unsaved changes.
+  of "RKM6"), block composition (as of "RKM7"), sprite graphics (as of
+  "RKM8"), intro text (as of "RKM9"), and bank-0 tile graphics -- font +
+  cutscene decor (as of "RKMA"). Loading refuses any file whose element
+  count doesn't match. A `*` next to the file name means there are
+  unsaved changes.
 - **Patch xrick binary...** -- injects the level currently open in the
   editor (layout + connections + sprites + tile hazard flags + tile
-  graphics + block composition + sprite graphics) directly into a
-  compiled xrick executable. See below.
-- **Import connections, sprites, tile hazards, tile graphics, blocks &&
-  sprite graphics from xrick binary...** -- the reverse direction: pulls
-  all of the above straight from a chosen binary's own compiled-in data
-  (via its ELF symbols), overwriting what's currently in the editor.
+  graphics + block composition + sprite graphics + intro text) directly
+  into a compiled xrick executable. See below.
+- **Import connections, sprites, tile hazards, tile graphics, blocks,
+  sprite graphics && intro text from xrick binary...** -- the reverse
+  direction: pulls all of the above straight from a chosen binary's own
+  compiled-in data (via its ELF symbols), overwriting what's currently
+  in the editor.
 
 ### How the xrick patch works
 
@@ -78,30 +93,37 @@ instead of the editor's 4-byte `int`, and same for `map_blocks`/
 `dat_tilesST.c`, so it lines up exactly). `sprites_data` doesn't need
 that widen/pack step -- the editor's in-memory `sprite_t` already
 matches the real engine's layout byte-for-byte, same as `tiles_data`.
+The 5 intro texts (`screen_imaptext_*`) are a special case again, the
+other way: each is patched **in place at its existing address** (so the
+`screen_imaptext[5]` pointer table pointing at them never needs
+touching), but every edit must still fit within that symbol's original,
+fixed byte size -- see the Text Editor section for how that's enforced.
 
 Given an **unstripped** xrick executable (ELF32, Linux), the patcher:
 
 1. Parses the ELF symbol table to find each relevant symbol by name
    (`map_bnums`, `map_submaps`, `map_connect`, `map_marks`,
-   `map_eflg_c`, `tiles_data`, `map_blocks`, `sprites_data`) and
-   computes where each lives in the file (works for any matching build
-   -- the location isn't hard-coded to one specific binary).
+   `map_eflg_c`, `tiles_data`, `map_blocks`, `sprites_data`, and the 5
+   `screen_imaptext_*`) and computes where each lives in the file (works
+   for any matching build -- the location isn't hard-coded to one
+   specific binary).
 2. Checks each symbol's size matches exactly what the editor currently
-   holds; refuses to touch anything if it doesn't look like a compatible
-   build.
+   holds (or, for the 5 texts, that the edited text still *fits* within
+   the original size); refuses to touch anything if it doesn't look like
+   a compatible build, or if a text edit has grown too long.
 3. Writes the current state (level layout, connections, sprites, hazard
-   flags, tile graphics, block composition, sprite graphics) over those
-   bytes, in a **copy** of the file named `<name>_patched` next to the
-   original -- the input executable is never modified -- and copies over
-   its file permissions (so the output stays executable).
+   flags, tile graphics, block composition, sprite graphics, intro text)
+   over those bytes, in a **copy** of the file named `<name>_patched`
+   next to the original -- the input executable is never modified -- and
+   copies over its file permissions (so the output stays executable).
 
 Tested against a real xrick 20-year-old Linux/x86 build: the patched
 region matches byte-for-byte and every other byte in the file is left
 untouched (see `src/test_xrick_patch.cpp`, for `map_bnums`; the same
 `elf32_patch_symbol()` helper is reused for every other symbol above,
-including `tiles_data`, `map_blocks`, and `sprites_data`, each with its
-own round-trip check -- see the Tile Editor, Block Editor, and Sprite
-Editor sections below).
+including `tiles_data`, `map_blocks`, `sprites_data`, and the 5 intro
+texts, each with its own round-trip check -- see the Tile Editor, Block
+Editor, Sprite Editor, and Text Editor sections below).
 
 ## Files
 
@@ -128,6 +150,14 @@ Editor sections below).
   `tile_import.h` closely and reuses its `readWholeFile()`/stb_image
   setup via `#include "tile_import.h"`; also
   `loadSpritesFromXrickBinary()`.
+- `src/dat_screens.c` / `include/screens_text_data.h` -- partial port of
+  `dat_screens.c` (text arrays only, see the Text Editor section and
+  that file's own header comment for what's excluded); the extern
+  declarations live in the `.h` (plain C, mirrors `sprites.h`/`tiles.h`)
+  so `dat_screens.c` itself stays plain C like the other `dat_*.c` files.
+- `src/screens_text.h` -- C++ editing layer on top of the above:
+  `ImapTextRow`/`ImapText`, `parseImapText()` (decodes the raw byte
+  format into editable rows), `defaultImapTexts()`.
 - `src/test_mapfile.cpp` -- standalone round-trip test for the `.map`
   format (not part of the CMake build; compile/run manually: `g++
   -std=c++17 -Iinclude -Isrc src/test_mapfile.cpp src/dat_tilesST.c -o
@@ -169,6 +199,49 @@ Editor sections below).
   block-swap logic (not part of the CMake build; compile/run manually:
   `g++ -std=c++17 -Iinclude -Isrc src/test_block_swap.cpp -o
   test_block_swap && ./test_block_swap`).
+- `src/test_screens_text.cpp` -- standalone test for `parseImapText()`
+  (decodes the "amazon" text and checks the first line reads "SOUTH
+  AMERICA 1945" exactly, blank-line detection, all 5 texts decode
+  cleanly -- not part of the CMake build; compile/run manually: `g++
+  -std=c++17 -Iinclude -Isrc src/test_screens_text.cpp src/dat_screens.c
+  -o test_screens_text && ./test_screens_text`).
+- `src/test_screens_text_encode.cpp` -- standalone test for
+  `encodeImapTextRaw()`/`encodeImapTextPadded()` (encode is the exact
+  inverse of decode for all 5 stock texts, padding lands on an exact
+  target size, oversized text is refused, exact-size text is unchanged
+  -- not part of the CMake build; compile/run manually: `g++
+  -std=c++17 -Iinclude -Isrc src/test_screens_text_encode.cpp
+  src/dat_screens.c -o test_screens_text_encode &&
+  ./test_screens_text_encode`).
+- `src/test_screens_persist.cpp` -- standalone round-trip test for the
+  RKM9 `.map` format (intro text, variable-length rows -- not part of
+  the CMake build; compile/run manually: `g++ -std=c++17 -Iinclude
+  -Isrc -Ithird_party src/test_screens_persist.cpp src/dat_tilesST.c
+  src/dat_spritesST.c src/dat_screens.c -o test_screens_persist &&
+  ./test_screens_persist`).
+- `src/test_patch_text.cpp` -- standalone test for the intro-text ELF
+  patch + reload round-trip, takes a synthetic (or real) ELF32 binary
+  path on the command line (not part of the CMake build): `g++
+  -std=c++17 -Iinclude -Isrc -Ithird_party src/test_patch_text.cpp
+  src/dat_screens.c -o test_patch_text && ./test_patch_text
+  /path/to/xrick`.
+- `src/test_decor_overlap.cpp` -- standalone test confirming the 5
+  cutscene decor tile ranges never overlap the font glyphs the 5 stock
+  intro texts actually use (not part of the CMake build; compile/run
+  manually: `g++ -std=c++17 -Iinclude -Isrc src/test_decor_overlap.cpp
+  src/dat_screens.c -o test_decor_overlap && ./test_decor_overlap`).
+- `src/test_bank0_persist.cpp` -- standalone round-trip test for the
+  RKMA `.map` format (bank-0 tile graphics -- not part of the CMake
+  build; compile/run manually: `g++ -std=c++17 -Iinclude -Isrc
+  -Ithird_party src/test_bank0_persist.cpp src/dat_tilesST.c
+  src/dat_spritesST.c src/dat_screens.c -o test_bank0_persist &&
+  ./test_bank0_persist`).
+- `src/test_map_backcompat.cpp` -- standalone test confirming an older
+  (pre-RKMA) `.map` file still opens fine and leaves bank 0 untouched
+  (not part of the CMake build; compile/run manually: `g++ -std=c++17
+  -Iinclude -Isrc -Ithird_party src/test_map_backcompat.cpp
+  src/dat_tilesST.c src/dat_spritesST.c src/dat_screens.c -o
+  test_map_backcompat && ./test_map_backcompat`).
 - `src/tiles_render.h` -- tile decoding + atlas texture construction
   (tiles and blocks, incl. `build_block_atlas()` which assembles blocks
   from `map_blocks`).
@@ -821,8 +894,11 @@ of canvas mode -- it doesn't touch the map at all, just the tile
 described above (`map_eflg_c`), both scoped to whichever single tile is
 currently selected. See `src/tile_import.h`.
 
-- **Grid** on the left: all 256 tiles of the selected bank (1 or 2, same
-  restriction as the Block Palette -- bank 0 is unused padding). Click to
+- **Bank selector**: bank 0 (labeled "0 (font/decor)"), plus 1 and 2.
+  Bank 0 is hidden from the Block Palette/Block Editor (no block ever
+  uses it in-game), but it isn't "unused padding" at all -- see
+  "Cutscene decor" below.
+- **Grid** on the left: all 256 tiles of the selected bank. Click to
   select.
 - **Detail panel** on the right: an enlarged preview, an **Import from
   image...** button, and all 8 hazard-flag checkboxes (Solid, Lethal,
@@ -870,28 +946,80 @@ currently selected. See `src/tile_import.h`.
   grid and preview, plus the Block Editor's 4x4 cell grid and tile
   picker below) -- `drawTileHazardBorder()` in `editor.cpp`, checked in
   priority order so only one color shows even if several bits are set:
-  Solid -> gray, Lethal -> red, Climb -> green, WayUp -> the plain
-  default blue border with a gray dashed overlay (WayUp shows up on
-  almost every platform in a real level, so a flat color there would be
-  as visually loud as Lethal); anything else (Vert/SuperPad/Fgnd/Bit01
-  alone, or no flags) stays plain blue.
+  Solid -> gray, Lethal -> red, Climb -> green, SuperPad -> yellow,
+  Fgnd -> white, WayUp -> the plain default blue border with a gray
+  dashed overlay (WayUp shows up on almost every platform in a real
+  level, so a flat color there would be as visually loud as Lethal);
+  anything else (Vert/Bit01 alone, or no flags) stays plain blue. The
+  Tile Editor's own Solid/Lethal/Climb/SuperPad/Fgnd/WayUp checkbox
+  labels (below) use the exact same colors (`HAZARD_COLOR_*` constants
+  near the top of `editor.cpp`, shared by both), so a glance at either
+  the border or the flag list tells the same story -- Vert/Bit01 stay
+  the normal text color there too, matching their plain-blue
+  (uncolored) border.
 
-**Persistence:** tile graphics (banks 1 and 2 only -- bank 0 is never
-edited, so it isn't stored) round-trip through `.map` files (a new
+### Cutscene decor (bank 0's *other* job)
+
+Bank 0 isn't unused padding -- it's shared by two things that never
+overlap in tile-index space: the **font** (every character the Text
+Editor's texts use, indexed by its own ASCII byte value -- see
+`screens_text.h`'s header comment) and the **background scenery** drawn
+behind Rick on the same between-levels intro screen. Found in the
+original source's `scr_imap.c`: `drawcenter()` paints a 6x6 grid of
+tiles (48x48px) starting at a different tile index per map --
+`{0x07, 0x5B, 0x7F, 0xA3, 0xC7}` for maps 0-4 respectively (`tn0[]` in
+the original, `SCREEN_IMAP_DECOR_START_TILE[]` here) -- walked
+left-to-right then top-to-bottom, same order the Block Editor's cells
+and the batch tile importer already use. Confirmed non-overlapping with
+the font's actual (stock) character usage by a dedicated test,
+`src/test_decor_overlap.cpp`.
+
+A **"Cutscene decor (bank 0)"** collapsible section (above "Batch
+import...", so it doesn't depend on which single tile happens to be
+selected) lists the 5 maps, each with a small live preview of its
+current 6x6 block and a **"Batch import into this decor..."** button --
+sets the bank to 0 and the batch start tile to that map's offset, then
+opens the same batch-import image picker described above (any image
+size, resampled to a 6x6 tile grid via the picked image's own
+dimensions -- typically a 48x48 source image needs no resampling at
+all). No new import machinery was needed here: the decor is just 36
+consecutive tiles, exactly what "Batch import..." already handles --
+this section is purely a discoverability shortcut so nobody has to know
+or type the magic tile offsets by hand.
+
+**Persistence:** bank 0's tile graphics (font + decor together, since
+they're the same underlying `tiles_data[0]`) round-trip through `.map`
+files (a new "RKMA" format -- hex "A" = 10, `MapFileHeaderV3::magic` is
+a fixed 4 bytes so "RKM10" doesn't fit -- extending RKM9 with
+`256 * sizeof(tile_t)` bytes of raw `tiles_data[0]` appended at the end;
+older files still open fine, bank 0 is just left as whatever it
+currently is). This closes a gap that existed for a while: bank 0 used
+to be flagged "never edited" and skipped entirely by the `.map` format,
+which became wrong the moment the Tile Editor started allowing bank-0
+edits -- those edits already survived **File > Patch xrick binary...**
+correctly (it always patched the full `tiles_data`, all 3 banks, via
+`sizeof(tiles_data)`) but would have silently vanished on a `.map`
+save/reload without this fix. Verified with dedicated tests:
+`src/test_bank0_persist.cpp` (round-trip, plus an untouched tile stays
+untouched) and `src/test_map_backcompat.cpp` (an older RKM9 file, which
+predates the bank-0 block, still opens fine and leaves bank 0
+untouched).
+
+**Persistence (banks 1 and 2):** round-trip through `.map` files (the
 "RKM6" format, extending RKM5 with `2 * 256 * sizeof(tile_t)` bytes of
 raw `tiles_data` appended at the end -- older files still open fine,
 graphics are just left as whatever they currently are) and through
 **File > Patch xrick binary...** (patches the `tiles_data` symbol --
-all 3 banks worth, since bank 0's compiled-in default still needs to
-reach the target binary -- alongside level layout/connections/sprites/
-hazard flags). Also importable directly from a chosen binary via
-**File > Import connections, sprites, tile hazards, tile graphics &&
-blocks from xrick binary...**. Both the `.map` round-trip and the ELF
-patch + reload round-trip are covered by dedicated tests
-(`src/test_tile_import.cpp` covers the image-import/decode path only;
-the `.map` and ELF-patch round-trips were verified with standalone
-throwaway test programs during development -- worth turning into
-proper `src/test_*.cpp` files if this area gets touched again).
+all 3 banks worth, including bank 0 -- alongside level layout/
+connections/sprites/hazard flags). Also importable directly from a
+chosen binary via **File > Import connections, sprites, tile hazards,
+tile graphics, blocks, sprite graphics && intro text from xrick
+binary...**. Both the `.map` round-trip and the ELF patch + reload
+round-trip are covered by dedicated tests (`src/test_tile_import.cpp`
+covers the image-import/decode path only; the `.map` and ELF-patch
+round-trips were verified with standalone throwaway test programs
+during development -- worth turning into proper `src/test_*.cpp` files
+if this area gets touched again).
 
 ## Block Editor (which tile goes where within a block -- `map_blocks`)
 
@@ -1025,6 +1153,113 @@ round-trip and the ELF patch + reload round-trip are covered by
 dedicated tests, `src/test_sprite_persist.cpp` and
 `src/test_patch_sprites.cpp` (same methodology as the tile/block
 persistence tests -- a synthetic ELF32 target for the latter).
+
+## Text Editor (between-levels intro text)
+
+A fourth standalone window (**Text Editor** checkbox in the top bar),
+independent of canvas mode. Edits the 5 texts shown between levels
+("SOUTH AMERICA 1945", "EGYPT, SOMETIMES LATER", etc.) -- ported from
+`xrick/src/data/dat_screens.c` into `src/dat_screens.c` (text arrays
+only -- the intro's animated-sprite list/steps are out of scope, see
+that file's header comment) and edited through `src/screens_text.h`.
+
+**This text isn't rendered with a dedicated font -- it's drawn using
+tile graphics from bank 0**, the same bank the Tile Editor and Block
+Editor otherwise treat as "unused padding" and hide from their bank
+selectors. Confirmed in the original source: `screen_introMap()` sets
+`draw_tilesBank = 0` (GFXST) then hands the raw text bytes straight to
+`draw_tilesList()`, whose inner `draw_tile(i)` reads
+`tiles_data[draw_tilesBank][i]` -- i.e. **each character byte in the
+text *is* a tile index**, and bank 0 is in fact the game's font (glyphs
+for A-Z, digits, punctuation, and `@` = space, indexed by their own
+ASCII value). This editor's Tile Editor can already view/edit those
+glyph tiles directly (bank 0 just isn't offered in its bank selector,
+same restriction as Block Palette/Block Editor) if a glyph ever needs
+fixing -- the Text Editor's live preview (see below) would immediately
+show the effect.
+
+The raw format (`screen_imaptext_amazon[]` etc.) is a byte stream: ASCII
+letters/digits/punctuation as-is, `@` (0x40) for space, each line ended
+by `0xFF` (the renderer's "carriage return, drop one tile row" signal --
+see `draw_tilesList()`/`draw_tilesSubList()` in the original `draw.c`),
+two consecutive `0xFF` for a blank spacing line (an empty sub-list
+between two `0xFF`s draws nothing but the line-drop still happens --
+purely visual spacing, *not* a timing pause despite how it might look),
+and a final `0xFE` ending the whole text. `parseImapText()` in
+`screens_text.h` mirrors that exact walk to decode into editable rows;
+`@` is converted to a real space character for editing (and back on the
+rare case it's typed literally) so nothing needs remembering about the
+raw encoding while typing.
+
+- **List** on the left: the 5 texts, in `game_map` order (the index the
+  real engine uses to pick which one to show) -- South America/Amazon,
+  Egypt, Castle, Missile Base, Much Later. Selecting one shows its
+  editable lines on the right.
+- **Per line**: a 30-character text field (screen-width limit, same as
+  the original data -- typing past it is simply not possible, the field
+  is capped rather than silently truncating on save), a live
+  character-count, a **Blank line after** checkbox (inserts the
+  double-`0xFF` spacing line described above), and **Up**/**Down**/**X**
+  to reorder or delete. **Add line** appends a new empty one.
+  **Reset to stock** discards edits and reloads the original text for
+  the selected entry from `screen_imaptext[]`.
+- **Live preview** at the bottom: renders every line using the actual
+  bank-0 font tiles from `tileAtlas[0]` (already built at startup for
+  every bank, just not otherwise exposed for banks other than 1/2), on
+  a dark background matching in-game contrast -- what you see there is
+  exactly what the real font glyphs look like, including any oddities
+  for characters the original game never used (the ASCII set actually
+  populated in the stock font is just what the 5 stock texts happen to
+  use: A-Z, 0-9, space, `.`, `,`, `?`; anything else typed will show
+  whatever tile happens to sit at that byte's index in bank 0, which is
+  very likely NOT a matching glyph -- the preview makes that obvious
+  immediately rather than silently producing garbage in-game).
+
+Verified with a dedicated test, `src/test_screens_text.cpp`: decodes the
+"amazon" text and confirms the first line reads exactly "SOUTH AMERICA
+1945" (centered with `@`-turned-spaces, matching the original data
+byte-for-byte), checks blank-line detection against a known stock row,
+and confirms all 5 texts decode cleanly.
+
+**Persistence:** `mapTexts` round-trips through `.map` files (a new
+"RKM9" format, extending RKM8 -- unlike every fixed-size table above,
+text length varies per edit, so each of the 5 texts is stored as an
+explicit row count followed by, per row, a length-prefixed text blob and
+a blank-line-after byte, rather than a raw fixed-size memory dump; older
+files still open fine, text is just left as whatever it currently is)
+and through **File > Patch xrick binary...**. The pointer-table wrinkle
+mentioned in an earlier pass here turned out to be a non-issue: the
+patch overwrites each `screen_imaptext_*` symbol **in place, at its
+existing address**, so `screen_imaptext[5]` (the pointer table) never
+needs touching -- addresses don't move. The real constraint is size:
+each symbol has a fixed byte length in the compiled binary, and
+`encodeImapTextPadded()` in `screens_text.h` enforces it -- refuses if
+the edited text encodes to more bytes than the original slot, and
+otherwise zero-fills the remainder. That remainder is harmless: the real
+engine's `draw_tilesList()` stops at the first `0xFE` it hits and never
+reads past it, and there's reliably at least one such unused byte to
+begin with -- every `screen_imaptext_*[]` is a C string literal
+initializer, which always carries an implicit trailing NUL beyond the
+`0xFE` end marker. (An earlier version of this padding stuffed extra
+*visible* spaces into the last line instead, based on the wrong
+assumption that every byte in the slot had to be meaningful content --
+caught by a test expecting an *unedited* text to patch back byte-for-
+byte identical to stock, which it wasn't.) Also importable directly
+from a chosen binary via **File > Import connections, sprites, tile
+hazards, tile graphics, blocks, sprite graphics && intro text from
+xrick binary...** (`loadScreenTextsFromXrickBinary()`).
+
+Verified with dedicated tests: `src/test_screens_text_encode.cpp`
+(encode is the exact inverse of decode, byte-for-byte, for all 5 stock
+texts; padding lands on an exact target size; oversized text is
+refused; an already-exact-size text encodes unchanged),
+`src/test_screens_persist.cpp` (`.map` round-trip with a shortened line,
+an added line, and a removed line, confirming the length-prefixed
+format handles variable length correctly and an untouched text stays
+untouched), and `src/test_patch_text.cpp` (ELF patch + reload round-trip
+against a synthetic binary with all 5 symbols, edits of several
+different lengths, confirming untouched texts patch back byte-identical
+to stock -- this is the test that caught the padding bug above).
 
 ## Investigation: "the last level is all shifted" (submap 38 onward)
 

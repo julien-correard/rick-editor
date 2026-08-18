@@ -64,6 +64,7 @@
 #include "xrick_eflg.h"   // EflgData, repackEflg -- patched alongside sprites/connections below
 #include "tiles.h"        // tile_t, tiles_data[][] -- persisted (banks 1/2) alongside eflg below
 #include "sprites.h"      // sprite_t, sprites_data[], SPRITES_NBR_SPRITES -- persisted below too
+#include "screens_text.h" // ImapText, SCREEN_IMAPTEXT_COUNT, encode/decode/patch helpers -- persisted below too
 
 static const int MAP_NBR_MARKS = 0x20B; // 523
 
@@ -406,20 +407,45 @@ inline bool repackMarks(MarksData &data, const ConnectionsData &conn, std::strin
 //   sprite_import.h and the Sprite Editor window), raw sprites_data[]
 //   memory dump. One flat table, no bank split (unlike tiles).
 //
+// Format ("RKM9" magic): same as RKM8, followed by, for each of the 5
+//   between-levels intro texts (see the Text Editor window and
+//   screens_text.h), in SCREEN_IMAPTEXT_LABELS[]/game_map order:
+//     int32 rowCount, then for each row: int32 textLen, `textLen` raw
+//     bytes (the row's text, real spaces -- NOT `@`), uint8 blankLineAfter.
+//   Unlike every fixed-size table above, text length varies per edit
+//   (it's not a raw memory dump of a fixed C array), hence the explicit
+//   length prefixes -- this is our own format's freedom; the ELF PATCH
+//   path below is the one still constrained to the original fixed byte
+//   count per text, since it overwrites an existing symbol in place.
+//
+// Format ("RKMA" magic -- hex "A" = 10; magic is a fixed 4-byte field,
+//   no room for two-digit "RKM10"): same as RKM9, followed by:
+//   256 * sizeof(tile_t) bytes: bank 0's tile GRAPHICS, raw
+//   tiles_data[0][] memory dump. RKM6 deliberately skipped bank 0
+//   ("unused padding, never shown/edited") -- no longer true once the
+//   Tile Editor exposed bank 0 for editing the font (Text Editor) and
+//   the cutscene decor (drawcenter() in the original scr_imap.c, see
+//   screens_text.h's SCREEN_IMAP_DECOR_* -- both live in bank 0), so
+//   this format bump closes the gap: bank 0 edits would otherwise
+//   silently vanish on save/reload despite already surviving the ELF
+//   patch path (which always covered all 3 banks via `sizeof(tiles_data)`).
+//
 // (v3/"RKM3" used a different, since-corrected sprite row/trigger encoding
 // -- not supported; re-save from that version's editor build if you still
 // have one.) Older "RKM2" (level + connections) and "RKMP" (level only)
 // files still open fine; missing parts (including tile hazards from any
 // file older than RKM5, tile graphics from any file older than RKM6,
-// block composition from any file older than RKM7, and sprite graphics
-// from any file older than RKM8) are simply left as they currently are.
+// block composition from any file older than RKM7, sprite graphics from
+// any file older than RKM8, intro text from any file older than RKM9,
+// and bank-0 tile graphics -- font/decor -- from any file older than
+// RKMA) are simply left as they currently are.
 struct MapFileHeaderV3 { char magic[4]; uint32_t bnumsCount; uint32_t submapCount; };
 
-inline bool saveMapFileWithSprites(const fs::path &path, const ConnectionsData &conn, const MarksData &marks, const EflgData &eflg, std::string &err)
+inline bool saveMapFileWithSprites(const fs::path &path, const ConnectionsData &conn, const MarksData &marks, const EflgData &eflg, const std::array<ImapText, SCREEN_IMAPTEXT_COUNT> &texts, std::string &err)
 {
     FILE *f = std::fopen(path.string().c_str(), "wb");
     if (!f) { err = "Could not open file for writing"; return false; }
-    MapFileHeaderV3 hdr{{'R', 'K', 'M', '8'}, (uint32_t)MAP_COUNT, (uint32_t)MAP_NBR_SUBMAPS};
+    MapFileHeaderV3 hdr{{'R', 'K', 'M', 'A'}, (uint32_t)MAP_COUNT, (uint32_t)MAP_NBR_SUBMAPS};
     bool ok = std::fwrite(&hdr, sizeof(hdr), 1, f) == 1
            && std::fwrite(map_bnums, sizeof(int), MAP_COUNT, f) == (size_t)MAP_COUNT;
     for (int i = 0; ok && i < MAP_NBR_SUBMAPS; i++)
@@ -450,6 +476,20 @@ inline bool saveMapFileWithSprites(const fs::path &path, const ConnectionsData &
             && std::fwrite(tiles_data[2], sizeof(tile_t), 0x100, f) == 0x100;
     ok = ok && std::fwrite(map_blocks, sizeof(int), 0x100 * 16, f) == (size_t)(0x100 * 16);
     ok = ok && std::fwrite(sprites_data, sizeof(sprite_t), SPRITES_NBR_SPRITES, f) == (size_t)SPRITES_NBR_SPRITES;
+    for (int i = 0; ok && i < SCREEN_IMAPTEXT_COUNT; i++)
+    {
+        int32_t rowCount = (int32_t)texts[i].rows.size();
+        ok = ok && std::fwrite(&rowCount, 4, 1, f) == 1;
+        for (auto &row : texts[i].rows)
+        {
+            int32_t textLen = (int32_t)row.text.size();
+            uint8_t blank = row.blankLineAfter ? 1 : 0;
+            ok = ok && std::fwrite(&textLen, 4, 1, f) == 1
+                    && std::fwrite(row.text.data(), 1, row.text.size(), f) == row.text.size()
+                    && std::fwrite(&blank, 1, 1, f) == 1;
+        }
+    }
+    ok = ok && std::fwrite(tiles_data[0], sizeof(tile_t), 0x100, f) == 0x100;
     std::fclose(f);
     if (!ok) { err = "Write error"; return false; }
     return true;
@@ -458,7 +498,7 @@ inline bool saveMapFileWithSprites(const fs::path &path, const ConnectionsData &
 // Loads a .map file into `conn`, `marks`, and `eflg`. Handles all format
 // generations (RKM5 / RKM4 / RKM2 / RKMP); parts absent from an older
 // file are left untouched (whatever was passed in on entry).
-inline bool loadMapFileWithSprites(const fs::path &path, ConnectionsData &conn, MarksData &marks, EflgData &eflg, std::string &err)
+inline bool loadMapFileWithSprites(const fs::path &path, ConnectionsData &conn, MarksData &marks, EflgData &eflg, std::array<ImapText, SCREEN_IMAPTEXT_COUNT> &texts, std::string &err)
 {
     std::ifstream probe(path, std::ios::binary);
     if (!probe) { err = "Could not open " + path.string(); return false; }
@@ -466,7 +506,9 @@ inline bool loadMapFileWithSprites(const fs::path &path, ConnectionsData &conn, 
     probe.read(magic, 4);
     probe.close();
 
-    bool hasSprites = std::memcmp(magic, "RKM8", 4) == 0;
+    bool hasBank0Tiles = std::memcmp(magic, "RKMA", 4) == 0;
+    bool hasTexts = hasBank0Tiles || std::memcmp(magic, "RKM9", 4) == 0;
+    bool hasSprites = hasTexts || std::memcmp(magic, "RKM8", 4) == 0;
     bool hasBlocks = hasSprites || std::memcmp(magic, "RKM7", 4) == 0;
     bool hasTiles = hasBlocks || std::memcmp(magic, "RKM6", 4) == 0;
     bool hasEflg = hasTiles || std::memcmp(magic, "RKM5", 4) == 0;
@@ -553,15 +595,47 @@ inline bool loadMapFileWithSprites(const fs::path &path, ConnectionsData &conn, 
         ok = std::fread(sprites_data, sizeof(sprite_t), SPRITES_NBR_SPRITES, f) == (size_t)SPRITES_NBR_SPRITES;
         if (!ok) { std::fclose(f); err = "Read error (sprite graphics)"; return false; }
     }
+    std::array<ImapText, SCREEN_IMAPTEXT_COUNT> loadedTexts = texts; // keep whatever was there if this file predates RKM9
+    if (hasTexts)
+    {
+        for (int i = 0; ok && i < SCREEN_IMAPTEXT_COUNT; i++)
+        {
+            int32_t rowCount;
+            ok = std::fread(&rowCount, 4, 1, f) == 1;
+            if (!ok) break;
+            ImapText t;
+            for (int r = 0; r < rowCount && ok; r++)
+            {
+                int32_t textLen;
+                uint8_t blank;
+                ok = std::fread(&textLen, 4, 1, f) == 1;
+                if (!ok) break;
+                std::string s(textLen, '\0');
+                ok = (textLen == 0) || (std::fread(&s[0], 1, (size_t)textLen, f) == (size_t)textLen);
+                ok = ok && std::fread(&blank, 1, 1, f) == 1;
+                if (ok) t.rows.push_back(ImapTextRow{s, blank != 0});
+            }
+            if (ok) loadedTexts[i] = t;
+        }
+        if (!ok) { std::fclose(f); err = "Read error (intro text)"; return false; }
+    }
+    if (hasBank0Tiles)
+    {
+        // Same direct-into-live-global convention as banks 1/2 above --
+        // caller rebuilds the tile/block atlas textures afterwards.
+        ok = std::fread(tiles_data[0], sizeof(tile_t), 0x100, f) == 0x100;
+        if (!ok) { std::fclose(f); err = "Read error (bank 0 tile graphics)"; return false; }
+    }
     std::fclose(f);
 
     conn = loadedConn;
     marks = loadedMarks;
     eflg = loadedEflg;
+    texts = loadedTexts;
     return true;
 }
 
-inline PatchResult patchXrickBinaryWithSprites(const fs::path &xrickPath, ConnectionsData &conn, MarksData &marks, const EflgData &eflg)
+inline PatchResult patchXrickBinaryWithSprites(const fs::path &xrickPath, ConnectionsData &conn, MarksData &marks, const EflgData &eflg, const std::array<ImapText, SCREEN_IMAPTEXT_COUNT> &texts)
 {
     std::string err;
     if (!repackConnections(conn, err))
@@ -611,6 +685,18 @@ inline PatchResult patchXrickBinaryWithSprites(const fs::path &xrickPath, Connec
     { res.message = "Could not patch map_blocks (block composition): " + err; return res; }
     if (!elf32_patch_symbol(buf, "sprites_data", sprites_data, sizeof(sprites_data), err))
     { res.message = "Could not patch sprites_data (sprite graphics): " + err; return res; }
+    for (int i = 0; i < SCREEN_IMAPTEXT_COUNT; i++)
+    {
+        size_t off = 0, symSize = 0;
+        if (!elf32_find_symbol_file_offset(buf, SCREEN_IMAPTEXT_SYMBOLS[i], off, symSize, err))
+        { res.message = "Could not patch " + std::string(SCREEN_IMAPTEXT_SYMBOLS[i]) + " (intro text): " + err; return res; }
+        std::vector<uint8_t> textBytes;
+        if (!encodeImapTextPadded(texts[i], symSize, textBytes, err))
+        { res.message = "Could not patch " + std::string(SCREEN_IMAPTEXT_SYMBOLS[i])
+            + " (" + SCREEN_IMAPTEXT_LABELS[i] + "): " + err; return res; }
+        if (!elf32_patch_symbol(buf, SCREEN_IMAPTEXT_SYMBOLS[i], textBytes.data(), textBytes.size(), err))
+        { res.message = "Could not patch " + std::string(SCREEN_IMAPTEXT_SYMBOLS[i]) + " (intro text): " + err; return res; }
+    }
 
     fs::path outPath = xrickPath;
     outPath.replace_filename(xrickPath.stem().string() + "_patched" + xrickPath.extension().string());
@@ -624,6 +710,6 @@ inline PatchResult patchXrickBinaryWithSprites(const fs::path &xrickPath, Connec
 
     res.ok = true;
     res.outputPath = outPath;
-    res.message = "Patched level written to " + outPath.string() + " (level layout + screen connections + sprites + tile hazard flags + tile graphics + block composition + sprite graphics)";
+    res.message = "Patched level written to " + outPath.string() + " (level layout + screen connections + sprites + tile hazard flags + tile graphics + block composition + sprite graphics + intro text)";
     return res;
 }

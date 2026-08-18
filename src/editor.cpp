@@ -35,6 +35,7 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "tile_import.h"
 #include "sprite_import.h"
+#include "screens_text.h"
 
 namespace fs = std::filesystem;
 
@@ -44,10 +45,24 @@ static inline int mapIndex(int col, int row) { return col + row * MAP_COLS; }
 // (defilement rapide).
 static const int FAST_SCROLL_CELLS = 20;
 
-// Bank 0 is unused padding data (never shown in the UI); only banks 1 and
-// 2 hold actual editable content, same as the previous editor's keys.
+// Bank 0 holds the font and cutscene decor (see the Tile Editor's
+// "Cutscene decor" section) but no block ever uses it in-game, so it's
+// excluded from the Block Palette/Block Editor's bank selectors -- only
+// banks 1 and 2 are "usable" in that specific sense.
 static const int FIRST_USABLE_BANK = 1;
 static const int LAST_USABLE_BANK = 2;
+
+// Hazard-flag colors, shared between the Tile Editor's checkbox labels
+// and drawTileHazardBorder() below -- kept in one place so the two
+// never drift apart. Only Solid/Lethal/Climb/WayUp get a dedicated
+// color (see drawTileHazardBorder()'s comment for why); the rest use
+// the UI's normal text color.
+static const ImVec4 HAZARD_COLOR_SOLID    (0.588f, 0.588f, 0.588f, 1.0f); // gray
+static const ImVec4 HAZARD_COLOR_LETHAL   (0.863f, 0.235f, 0.235f, 1.0f); // red
+static const ImVec4 HAZARD_COLOR_CLIMB    (0.275f, 0.784f, 0.353f, 1.0f); // green
+static const ImVec4 HAZARD_COLOR_WAYUP    (0.314f, 0.549f, 0.941f, 1.0f); // blue (also the plain default border)
+static const ImVec4 HAZARD_COLOR_FGND     (0.95f,  0.95f,  0.95f,  1.0f); // white
+static const ImVec4 HAZARD_COLOR_SPAD     (0.95f,  0.85f,  0.15f,  1.0f); // yellow
 
 struct Camera
 {
@@ -132,6 +147,17 @@ struct SpriteEditorState
     bool open = false;
     int selectedSprite = -1;  // -1 = nothing selected yet
     int batchStartSprite = 0; // "Batch import..." starting sprite index
+};
+
+// State for the standalone Text Editor window -- edits the 5
+// between-levels intro texts (screen_imaptext_*, see screens_text.h).
+// The live editable text itself (mapTexts) lives in main()'s state
+// alongside connections/sprites/eflg, not in here -- this struct is
+// just which entry/row is selected in the UI.
+struct TextEditorState
+{
+    bool open = false;
+    int selected = 0; // 0-4, index into mapTexts[] / SCREEN_IMAPTEXT_LABELS[]
 };
 
 enum class DialogPurpose { OpenMap, SaveMap, PickXrickBinary, PickXrickBinaryForConnections, ImportTileImage, BatchImportTileImage, ImportSpriteImage, BatchImportSpriteImage };
@@ -454,11 +480,11 @@ static void requestSaveAs(FileDialog &fd, const fs::path &currentPath)
         std::snprintf(fd.filename, sizeof(fd.filename), "%s", currentPath.filename().string().c_str());
     fd.error.clear();
 }
-static void doSave(EditorState &st, FileDialog &fd, const ConnectionsData &conn, const MarksData &sprites, const EflgData &eflg)
+static void doSave(EditorState &st, FileDialog &fd, const ConnectionsData &conn, const MarksData &sprites, const EflgData &eflg, const std::array<ImapText, SCREEN_IMAPTEXT_COUNT> &texts)
 {
     if (st.currentPath.empty()) { requestSaveAs(fd, st.currentPath); return; }
     std::string err;
-    if (saveMapFileWithSprites(st.currentPath, conn, sprites, eflg, err)) st.dirty = false;
+    if (saveMapFileWithSprites(st.currentPath, conn, sprites, eflg, texts, err)) st.dirty = false;
 }
 
 // Rebuilds the tile atlas AND the block atlas for one bank after a tile
@@ -489,19 +515,22 @@ static void rebuildBlockAtlasOnly(SDL_Renderer *renderer, SDL_Texture *tileAtlas
 // have to open the Tile Editor to notice you just placed a lethal tile
 // into a block. Only one color shows even if several flags are set --
 // checked in priority order, first match wins:
-//   Solid -> gray, Lethal -> red, Climb -> green, WayUp -> blue with a
-//   gray hatch overlay (blue is also the plain default border when none
-//   of these four are set -- Vert/SuperPad/Fgnd/Bit01 don't get their
-//   own color here). WayUp keeps the default blue underneath and adds
-//   dashes on top rather than a flat color, since a real xrick level
-//   uses WayUp constantly on ordinary-looking platforms and a solid
-//   color there would be visually as loud as Lethal.
+//   Solid -> gray, Lethal -> red, Climb -> green, SuperPad -> yellow,
+//   Fgnd -> white, WayUp -> blue with a gray hatch overlay (blue is also
+//   the plain default border when none of these are set -- Vert/Bit01
+//   don't get their own color here). WayUp keeps the default blue
+//   underneath and adds dashes on top rather than a flat color, since a
+//   real xrick level uses WayUp constantly on ordinary-looking
+//   platforms and a solid color there would be visually as loud as
+//   Lethal.
 static void drawTileHazardBorder(ImDrawList *dl, ImVec2 rmin, ImVec2 rmax, uint8_t flags)
 {
-    const ImU32 gray  = IM_COL32(150, 150, 150, 255);
-    const ImU32 red   = IM_COL32(220, 60, 60, 255);
-    const ImU32 green = IM_COL32(70, 200, 90, 255);
-    const ImU32 blue  = IM_COL32(80, 140, 240, 255);
+    const ImU32 gray   = ImGui::ColorConvertFloat4ToU32(HAZARD_COLOR_SOLID);
+    const ImU32 red    = ImGui::ColorConvertFloat4ToU32(HAZARD_COLOR_LETHAL);
+    const ImU32 green  = ImGui::ColorConvertFloat4ToU32(HAZARD_COLOR_CLIMB);
+    const ImU32 blue   = ImGui::ColorConvertFloat4ToU32(HAZARD_COLOR_WAYUP);
+    const ImU32 white  = ImGui::ColorConvertFloat4ToU32(HAZARD_COLOR_FGND);
+    const ImU32 yellow = ImGui::ColorConvertFloat4ToU32(HAZARD_COLOR_SPAD);
     const float thickness = 2.0f;
 
     ImU32 color = blue;
@@ -509,6 +538,8 @@ static void drawTileHazardBorder(ImDrawList *dl, ImVec2 rmin, ImVec2 rmax, uint8
     if (flags & EFLG_SOLID) color = gray;
     else if (flags & EFLG_LETHAL) color = red;
     else if (flags & EFLG_CLIMB) color = green;
+    else if (flags & EFLG_SPAD) color = yellow;
+    else if (flags & EFLG_FGND) color = white;
     else if (flags & EFLG_WAYUP) hatch = true; // stays blue, gets the hatch below
 
     dl->AddRect(rmin, rmax, color, 0.0f, 0, thickness);
@@ -574,10 +605,12 @@ int main(int argc, char *argv[])
     TileEditorState tileEditor;
     BlockEditorState blockEditor;
     SpriteEditorState spriteEditor;
+    TextEditorState textEditor;
     FileDialog fileDialog;
     ConnectionsData connections = defaultConnections();
     MarksData sprites = defaultMarks();
     EflgData eflg = defaultEflg();
+    std::array<ImapText, SCREEN_IMAPTEXT_COUNT> mapTexts = defaultImapTexts();
     std::string patchResultMessage;
     bool patchResultOk = false;
     updateWindowTitle(window, st);
@@ -806,12 +839,17 @@ int main(int argc, char *argv[])
 
         // --- Main menu bar (the only File access point, as requested --
         // no separate dockable window for it) ---
+        // --- Main menu bar (File dropdown only -- needs a real ImGui
+        // menu bar for BeginMenu()/MenuItem() to work at all; kept
+        // separate from the toolbar below since it's the one thing here
+        // that can't wrap to a second line by itself and realistically
+        // never needs to). ---
         if (ImGui::BeginMainMenuBar())
         {
             if (ImGui::BeginMenu("File"))
             {
                 if (ImGui::MenuItem("Open...", "Ctrl+O")) requestOpen(fileDialog);
-                if (ImGui::MenuItem("Save", "Ctrl+S")) doSave(st, fileDialog, connections, sprites, eflg);
+                if (ImGui::MenuItem("Save", "Ctrl+S")) doSave(st, fileDialog, connections, sprites, eflg, mapTexts);
                 if (ImGui::MenuItem("Save As...")) requestSaveAs(fileDialog, st.currentPath);
                 ImGui::Separator();
                 if (ImGui::MenuItem("Patch xrick binary..."))
@@ -823,7 +861,7 @@ int main(int argc, char *argv[])
                     fileDialog.filename[0] = '\0';
                     fileDialog.error.clear();
                 }
-                if (ImGui::MenuItem("Import connections, sprites, tile hazards, tile graphics, blocks && sprite graphics from xrick binary..."))
+                if (ImGui::MenuItem("Import connections, sprites, tile hazards, tile graphics, blocks, sprite graphics && intro text from xrick binary..."))
                 {
                     fileDialog.show = true;
                     fileDialog.saveMode = false;
@@ -838,8 +876,49 @@ int main(int argc, char *argv[])
             }
             if (!st.currentPath.empty())
                 ImGui::Text("  %s%s", st.currentPath.filename().string().c_str(), st.dirty ? " *" : "");
+            ImGui::EndMainMenuBar();
+        }
+        const float menuBarH = ImGui::GetFrameHeight();
 
-            ImGui::Separator();
+        // --- Toolbar (everything that used to live in the menu bar
+        // besides File itself) -- a plain window, not a real ImGui menu
+        // bar, specifically so it CAN wrap to a second line: menu bars
+        // are hard-fixed to one line with no wrapping support at all, and
+        // this row has grown enough editor toggles over time that it can
+        // overflow a narrower window/screen. Wrapping works by calling
+        // SameLine() then immediately checking whether that pushed the
+        // cursor past the right edge -- if so, NewLine() overrides it and
+        // drops to a fresh line. That's width-agnostic (unlike "assume
+        // the next item is about the same width as this one", which the
+        // tile/block grids elsewhere use safely only because every item
+        // in THOSE rows is a uniform-size thumbnail); this row mixes
+        // radio buttons, checkboxes, text, and small buttons of very
+        // different widths, so the general version is worth the couple
+        // extra lines of code. Real vertical-bar separators
+        // (`ImGui::Separator()`) only render that way inside an actual
+        // menu bar, so a light "|" glyph stands in for them here -- it's
+        // just another wrap-checked item like anything else in the row. ---
+        float toolbarH;
+        {
+            ImGui::SetNextWindowPos(ImVec2(0, menuBarH));
+            ImGui::SetNextWindowSize(ImVec2((float)viewportW, 0)); // 0 height = auto-fit to content (1 or 2 lines)
+            ImGui::Begin("##toolbar", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize
+                          | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse
+                          | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
+
+            float toolbarRight = ImGui::GetWindowPos().x + (float)viewportW - ImGui::GetStyle().WindowPadding.x;
+            auto wrap = [&]()
+            {
+                ImGui::SameLine();
+                if (ImGui::GetCursorScreenPos().x > toolbarRight) ImGui::NewLine();
+            };
+            auto divider = [&]()
+            {
+                ImGui::SameLine(0, 12);
+                ImGui::TextDisabled("|");
+                wrap();
+            };
+
             struct ModeOpt { CanvasMode mode; const char *label; const char *tip; };
             static const ModeOpt modeOpts[] = {
                 {CanvasMode::Submap, "Submap", "Look around and inspect Screen Connections, without editing anything"},
@@ -851,39 +930,44 @@ int main(int argc, char *argv[])
                 bool active = st.canvasMode == opt.mode;
                 if (ImGui::RadioButton(opt.label, active)) st.canvasMode = opt.mode;
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", opt.tip);
-                ImGui::SameLine();
+                wrap();
             }
 
-            ImGui::Separator();
+            divider();
             ImGui::Checkbox("Tile Editor", &tileEditor.open);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Edit individual tile graphics (import from image) and their hazard flags -- independent of the map canvas");
-            ImGui::SameLine();
+            wrap();
             ImGui::Checkbox("Block Editor", &blockEditor.open);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Compose blocks out of tiles (map_blocks) -- independent of the map canvas");
-            ImGui::SameLine();
+            wrap();
             ImGui::Checkbox("Sprite Editor", &spriteEditor.open);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Edit sprite graphics (import from image, single or batch) -- independent of the map canvas");
-            ImGui::SameLine();
+            wrap();
+            ImGui::Checkbox("Text Editor", &textEditor.open);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Edit the 5 between-levels intro texts -- independent of the map canvas");
+            wrap();
 
-            ImGui::Separator();
+            divider();
             ImGui::Checkbox("Grid", &st.showGrid);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show the block grid (one square = one block) -- G");
-            ImGui::SameLine();
+            wrap();
 
-            ImGui::Separator();
+            divider();
             if (ImGui::SmallButton("-")) zoomAt(st, viewportW / 2.0f, viewportH / 2.0f, 1.0f / 1.25f);
-            ImGui::SameLine();
+            wrap();
             ImGui::Text("%.0f%%", st.cam.zoom * 100.0f);
-            ImGui::SameLine();
+            wrap();
             if (ImGui::SmallButton("+")) zoomAt(st, viewportW / 2.0f, viewportH / 2.0f, 1.25f);
-            ImGui::SameLine();
+            wrap();
             if (ImGui::SmallButton("Reset zoom")) { st.cam.zoom = 2.0f; }
+            wrap();
 
-            ImGui::Separator();
+            divider();
             if (ImGui::SmallButton("Fill selection (F)")) clearSelection(st, st.selectedBlock);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Fill the current rectangle selection with the selected block");
+            wrap();
 
-            ImGui::Separator();
+            divider();
             {
                 int mx, my; SDL_GetMouseState(&mx, &my);
                 int col, row;
@@ -894,7 +978,8 @@ int main(int argc, char *argv[])
                     ImGui::Text("out of map -- tile row %d", screenToTileRow(st, (float)my));
             }
 
-            ImGui::EndMainMenuBar();
+            toolbarH = ImGui::GetWindowHeight();
+            ImGui::End();
         }
 
         // Shared docked-panel geometry for the 3 mutually-exclusive tool
@@ -904,7 +989,7 @@ int main(int argc, char *argv[])
         // movable or resizable -- there's nothing to arrange, so letting
         // them float/overlap the canvas was just friction.
         const float toolPanelW = 430.0f; // wide enough for 8 block thumbnails/row with room for the scrollbar
-        const float topBarH = ImGui::GetFrameHeight();
+        const float topBarH = menuBarH + toolbarH; // 1 or 2 toolbar lines, depending on whether it wrapped this frame
         const ImVec2 toolPanelPos((float)viewportW - toolPanelW, topBarH);
         const ImVec2 toolPanelSize(toolPanelW, (float)viewportH - topBarH);
         const ImGuiWindowFlags toolPanelFlags = ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse;
@@ -916,18 +1001,20 @@ int main(int argc, char *argv[])
             switch (fileDialog.purpose)
             {
                 case DialogPurpose::SaveMap:
-                    if (saveMapFileWithSprites(chosenPath, connections, sprites, eflg, err)) { st.currentPath = chosenPath; st.dirty = false; }
+                    if (saveMapFileWithSprites(chosenPath, connections, sprites, eflg, mapTexts, err)) { st.currentPath = chosenPath; st.dirty = false; }
                     else fileDialog.error = err;
                     break;
                 case DialogPurpose::OpenMap:
-                    if (loadMapFileWithSprites(chosenPath, connections, sprites, eflg, err))
+                    if (loadMapFileWithSprites(chosenPath, connections, sprites, eflg, mapTexts, err))
                     {
                         st.currentPath = chosenPath; st.dirty = false; st.sel.active = false;
                         // Harmless no-op if this file predates RKM6/RKM7/
-                        // RKM8 (tile graphics/block composition/sprite
-                        // graphics unchanged) -- always rebuilding is
-                        // simpler than tracking whether they actually
-                        // moved, and this only runs once per Open.
+                        // RKM8/RKM9/RKMA (tile graphics/block composition/
+                        // sprite graphics/intro text/bank-0 tile graphics
+                        // unchanged) -- always rebuilding is simpler than
+                        // tracking whether they actually moved, and this
+                        // only runs once per Open.
+                        rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 0);
                         rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 1);
                         rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 2);
                         rebuildSpriteAtlas(renderer, spriteAtlas);
@@ -936,7 +1023,7 @@ int main(int argc, char *argv[])
                     break;
                 case DialogPurpose::PickXrickBinary:
                 {
-                    PatchResult r = patchXrickBinaryWithSprites(chosenPath, connections, sprites, eflg);
+                    PatchResult r = patchXrickBinaryWithSprites(chosenPath, connections, sprites, eflg, mapTexts);
                     patchResultMessage = r.message;
                     patchResultOk = r.ok;
                     ImGui::OpenPopup("Result");
@@ -951,18 +1038,20 @@ int main(int argc, char *argv[])
                     if (ok) ok = loadTilesFromXrickBinary(chosenPath, cerr);
                     if (ok) ok = loadBlocksFromXrickBinary(chosenPath, cerr);
                     if (ok) ok = loadSpritesFromXrickBinary(chosenPath, cerr);
+                    if (ok) ok = loadScreenTextsFromXrickBinary(chosenPath, mapTexts, cerr);
                     if (ok)
                     {
+                        rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 0);
                         rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 1);
                         rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 2);
                         rebuildSpriteAtlas(renderer, spriteAtlas);
                     }
                     patchResultMessage = ok
                         ? "Imported " + std::to_string(MAP_NBR_SUBMAPS) + " submaps (connections + sprites + tile "
-                          "hazard flags + tile graphics + block composition + sprite graphics) from "
+                          "hazard flags + tile graphics + block composition + sprite graphics + intro text) from "
                           + chosenPath.filename().string()
                           + ". See the \"Screen Connections\", \"Sprite Tools\", Block Palette, Tile Editor, "
-                            "Block Editor, and Sprite Editor windows."
+                            "Block Editor, Sprite Editor, and Text Editor windows."
                         : cerr;
                     patchResultOk = ok;
                     ImGui::OpenPopup("Result");
@@ -1153,13 +1242,77 @@ int main(int argc, char *argv[])
 
             ImGui::Text("Tile bank:");
             ImGui::SameLine();
+            {
+                char label0[24]; std::snprintf(label0, sizeof label0, "0 (font/decor)##tebank0");
+                if (ImGui::RadioButton(label0, tileEditor.bank == 0)) tileEditor.bank = 0;
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Bank 0 isn't unused -- it's the font (see the Text "
+                                                            "Editor) AND the between-levels cutscene decor (see "
+                                                            "below). Hidden from Block Palette/Block Editor since "
+                                                            "no block ever uses it in-game.");
+            ImGui::SameLine();
             for (int b = FIRST_USABLE_BANK; b <= LAST_USABLE_BANK; b++)
             {
-                if (b > FIRST_USABLE_BANK) ImGui::SameLine();
+                ImGui::SameLine();
                 char label[16]; std::snprintf(label, sizeof label, "%d##tebank", b);
                 if (ImGui::RadioButton(label, tileEditor.bank == b)) tileEditor.bank = b;
             }
-            ImGui::TextDisabled("(bank 0 is unused padding data, hidden here too)");
+            ImGui::Separator();
+
+            // Cutscene decor shortcuts: bank 0, tiles laid out in a 6x6
+            // block per map (see screens_text.h) -- jump the bank/batch-
+            // start fields above to the right spot with one click,
+            // rather than needing to know/type the magic tile numbers.
+            if (ImGui::CollapsingHeader("Cutscene decor (bank 0)"))
+            {
+                ImGui::Indent();
+                ImGui::TextWrapped("Background scenery behind Rick on the between-levels intro screen -- a "
+                                    "6x6 block of tiles (48x48px) per map, bank 0. Same bank as the font (Text "
+                                    "Editor), different tile range -- they don't overlap.");
+                ImTextureID decorTexId = (ImTextureID)(intptr_t)tileAtlas[0];
+                for (int m = 0; m < SCREEN_IMAPTEXT_COUNT; m++)
+                {
+                    ImGui::PushID(1000 + m);
+                    int start = SCREEN_IMAP_DECOR_START_TILE[m];
+                    ImGui::BeginGroup();
+                    for (int r = 0; r < SCREEN_IMAP_DECOR_ROWS; r++)
+                    {
+                        for (int c = 0; c < SCREEN_IMAP_DECOR_COLS; c++)
+                        {
+                            int t = start + r * SCREEN_IMAP_DECOR_COLS + c;
+                            float u0 = (float)(t % ATLAS_TILES_PER_ROW) / ATLAS_TILES_PER_ROW;
+                            float v0 = (float)(t / ATLAS_TILES_PER_ROW) / ATLAS_TILES_PER_ROW;
+                            float u1 = u0 + 1.0f / ATLAS_TILES_PER_ROW;
+                            float v1 = v0 + 1.0f / ATLAS_TILES_PER_ROW;
+                            ImGui::Image(decorTexId, ImVec2(12, 12), ImVec2(u0, v0), ImVec2(u1, v1));
+                            if (c != SCREEN_IMAP_DECOR_COLS - 1) ImGui::SameLine(0, 0);
+                        }
+                    }
+                    ImGui::EndGroup();
+                    ImGui::SameLine();
+                    ImGui::BeginGroup();
+                    ImGui::Text("%s (tiles %d-%d)", SCREEN_IMAPTEXT_LABELS[m], start,
+                                start + SCREEN_IMAP_DECOR_COLS * SCREEN_IMAP_DECOR_ROWS - 1);
+                    if (ImGui::SmallButton("Batch import into this decor..."))
+                    {
+                        tileEditor.bank = 0;
+                        tileEditor.batchStartTile = start;
+                        fileDialog.show = true;
+                        fileDialog.saveMode = false;
+                        fileDialog.purpose = DialogPurpose::BatchImportTileImage;
+                        fileDialog.extFilter = {".png", ".bmp", ".tga", ".jpg", ".jpeg", ".gif", ".psd"};
+                        fileDialog.filename[0] = '\0';
+                        fileDialog.error.clear();
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Sets bank to 0 and batch start tile to %d, then "
+                                                                   "opens the image picker -- pick a 48x48 (or any "
+                                                                   "size, resampled to a 6x6 tile grid) image to "
+                                                                   "replace this whole decor at once.", start);
+                    ImGui::EndGroup();
+                    ImGui::PopID();
+                }
+                ImGui::Unindent();
+            }
             ImGui::Separator();
 
             // Batch import: doesn't depend on the tile grid selection
@@ -1266,23 +1419,30 @@ int main(int argc, char *argv[])
                                                                    "climbable, lethal, etc. (see xrick_eflg.h). "
                                                                    "Edits this tile's byte directly.");
                     uint8_t &flags = eflg.bank[tileEditor.bank - 1][tileEditor.selectedTile];
-                    auto flagBit = [&](const char *label, int bit, const char *tip)
+                    auto flagBit = [&](const char *label, int bit, const char *tip, const ImVec4 *color = nullptr)
                     {
                         bool on = (flags & bit) != 0;
+                        if (color) ImGui::PushStyleColor(ImGuiCol_Text, *color);
                         if (ImGui::Checkbox(label, &on))
                         {
                             flags = on ? (flags | bit) : (flags & ~bit);
                             st.dirty = true;
                         }
+                        if (color) ImGui::PopStyleColor();
                         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
                     };
-                    flagBit("Solid", EFLG_SOLID, "SOLID -- can't walk/fall through");
-                    flagBit("Lethal", EFLG_LETHAL, "LETHAL -- kills an entity that touches it (this is the corpse-transform trigger)");
-                    flagBit("Climb", EFLG_CLIMB, "CLIMB -- entities can climb here");
+                    // Solid/Lethal/Climb/WayUp get the same color here as
+                    // they do on a tile's border (drawTileHazardBorder())
+                    // -- Vert/Bit01 don't have a dedicated border color
+                    // of their own, so their labels stay the normal
+                    // text color.
+                    flagBit("Solid", EFLG_SOLID, "SOLID -- can't walk/fall through", &HAZARD_COLOR_SOLID);
+                    flagBit("Lethal", EFLG_LETHAL, "LETHAL -- kills an entity that touches it (this is the corpse-transform trigger)", &HAZARD_COLOR_LETHAL);
+                    flagBit("Climb", EFLG_CLIMB, "CLIMB -- entities can climb here", &HAZARD_COLOR_CLIMB);
                     flagBit("Vert", EFLG_VERT, "VERT -- vertical move only (usually paired with Climb)");
-                    flagBit("WayUp", EFLG_WAYUP, "WAYUP -- solid except when moving up through it (jump-through platform)");
-                    flagBit("SuperPad", EFLG_SPAD, "SPAD -- solid, but bounces entities skyward");
-                    flagBit("Fgnd", EFLG_FGND, "FGND -- foreground, drawn in front of / hides entities");
+                    flagBit("WayUp", EFLG_WAYUP, "WAYUP -- solid except when moving up through it (jump-through platform)", &HAZARD_COLOR_WAYUP);
+                    flagBit("SuperPad", EFLG_SPAD, "SPAD -- solid, but bounces entities skyward", &HAZARD_COLOR_SPAD);
+                    flagBit("Fgnd", EFLG_FGND, "FGND -- foreground, drawn in front of / hides entities", &HAZARD_COLOR_FGND);
                     flagBit("Bit01", EFLG_01, "Undocumented bit in the original source -- exposed raw");
 
                     ImGui::Spacing();
@@ -1604,6 +1764,125 @@ int main(int argc, char *argv[])
                                         "becomes transparent; opaque pixels are matched to the closest of "
                                         "the 15 non-transparent palette colors.", SPRITE_W, SPRITE_H, SPRITE_ALPHA_THRESHOLD);
                 }
+            }
+            ImGui::EndChild();
+
+            ImGui::End();
+        }
+
+        // --- Text Editor -- standalone window, independent of canvas
+        // mode. Edits the 5 between-levels intro texts (mapTexts, in
+        // memory only -- see screens_text.h/dat_screens.c). Not tied to
+        // any bank/atlas rebuild since it doesn't touch tiles_data --
+        // characters ARE tile indices into bank 0 (the "unused padding"
+        // bank everywhere else in this editor is in fact the font), so
+        // the live preview below reads tileAtlas[0] directly and needs
+        // no atlas rebuild of its own. ---
+        if (textEditor.open)
+        {
+            ImGui::SetNextWindowSize(ImVec2(640, 560), ImGuiCond_FirstUseEver);
+            ImGui::Begin("Text Editor", &textEditor.open);
+            ImGui::TextDisabled("Between-levels intro text -- each character is a tile from bank 0 (the font). "
+                                 "Max 30 characters/line (screen width); type real spaces, they're stored as "
+                                 "'@' internally same as the original data.");
+            ImGui::Separator();
+
+            float listW = 220.0f;
+            ImGui::BeginChild("##textList", ImVec2(listW, 0), true);
+            for (int i = 0; i < SCREEN_IMAPTEXT_COUNT; i++)
+            {
+                if (ImGui::Selectable(SCREEN_IMAPTEXT_LABELS[i], textEditor.selected == i))
+                    textEditor.selected = i;
+            }
+            ImGui::EndChild();
+
+            ImGui::SameLine();
+            ImGui::BeginChild("##textDetail", ImVec2(0, 0));
+            {
+                ImapText &txt = mapTexts[textEditor.selected];
+
+                if (ImGui::SmallButton("Reset to stock"))
+                {
+                    txt = parseImapText(screen_imaptext[textEditor.selected]);
+                    st.dirty = true;
+                }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Discards edits, reloads the original game text for this entry");
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Add line") && txt.rows.size() < 40)
+                {
+                    txt.rows.push_back(ImapTextRow{});
+                    st.dirty = true;
+                }
+
+                ImGui::Separator();
+                ImGui::Text("Lines:");
+
+                int removeRow = -1, moveUp = -1, moveDown = -1;
+                for (int i = 0; i < (int)txt.rows.size(); i++)
+                {
+                    ImGui::PushID(i);
+                    ImapTextRow &row = txt.rows[i];
+
+                    char buf[32];
+                    size_t n = std::min(row.text.size(), (size_t)30);
+                    std::memcpy(buf, row.text.data(), n);
+                    buf[n] = '\0';
+                    ImGui::SetNextItemWidth(220);
+                    if (ImGui::InputText("##line", buf, sizeof(buf)))
+                    {
+                        row.text = buf;
+                        st.dirty = true;
+                    }
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("%2d/30", (int)row.text.size());
+                    ImGui::SameLine();
+                    if (ImGui::Checkbox("Blank line after", &row.blankLineAfter))
+                        st.dirty = true;
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Adds an extra empty row of vertical spacing "
+                                                                   "after this line (visual only)");
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Up") && i > 0) moveUp = i;
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Down") && i < (int)txt.rows.size() - 1) moveDown = i;
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("X") && txt.rows.size() > 1) removeRow = i;
+
+                    ImGui::PopID();
+                }
+                if (removeRow >= 0) { txt.rows.erase(txt.rows.begin() + removeRow); st.dirty = true; }
+                if (moveUp >= 0) { std::swap(txt.rows[moveUp], txt.rows[moveUp - 1]); st.dirty = true; }
+                if (moveDown >= 0) { std::swap(txt.rows[moveDown], txt.rows[moveDown + 1]); st.dirty = true; }
+
+                ImGui::Separator();
+                ImGui::Text("Preview (bank 0 font tiles, as rendered in-game):");
+                ImGui::BeginChild("##textPreview", ImVec2(0, 0), true);
+                {
+                    ImTextureID fontTexId = (ImTextureID)(intptr_t)tileAtlas[0];
+                    float glyph = 16.0f; // 8px tile x2 for visibility
+                    ImDrawList *dl = ImGui::GetWindowDrawList();
+                    ImVec2 origin = ImGui::GetCursorScreenPos();
+                    dl->AddRectFilled(origin, ImVec2(origin.x + 30 * glyph, origin.y + (float)txt.rows.size() * glyph
+                                                      + (float)std::count_if(txt.rows.begin(), txt.rows.end(),
+                                                            [](const ImapTextRow &r){ return r.blankLineAfter; }) * glyph),
+                                       IM_COL32(20, 20, 30, 255));
+                    for (const ImapTextRow &row : txt.rows)
+                    {
+                        for (char ch : row.text)
+                        {
+                            uint8_t tileIdx = (uint8_t)(ch == ' ' ? '@' : ch);
+                            float u0 = (float)(tileIdx % ATLAS_TILES_PER_ROW) / ATLAS_TILES_PER_ROW;
+                            float v0 = (float)(tileIdx / ATLAS_TILES_PER_ROW) / ATLAS_TILES_PER_ROW;
+                            float u1 = u0 + 1.0f / ATLAS_TILES_PER_ROW;
+                            float v1 = v0 + 1.0f / ATLAS_TILES_PER_ROW;
+                            ImGui::Image(fontTexId, ImVec2(glyph, glyph), ImVec2(u0, v0), ImVec2(u1, v1));
+                            ImGui::SameLine(0, 0);
+                        }
+                        ImGui::NewLine();
+                        if (row.blankLineAfter)
+                            ImGui::Dummy(ImVec2(1, glyph));
+                    }
+                }
+                ImGui::EndChild();
             }
             ImGui::EndChild();
 

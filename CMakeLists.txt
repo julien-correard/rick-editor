@@ -27,6 +27,7 @@ add_executable(rickeditor
     src/editor.cpp
     src/dat_tilesST.c   # source de verite unique pour les tuiles graphiques
     src/dat_spritesST.c # idem pour les sprites (entites/graphismes)
+    src/dat_screens.c   # idem pour le texte d'intro entre les niveaux (partiel, voir le fichier)
 )
 # dat_spritesST.c est vendorise tel quel depuis la source xrick d'origine ;
 # son style d'initialisation imbrique (accolades internes elidees) declenche
