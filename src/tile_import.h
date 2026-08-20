@@ -154,6 +154,24 @@ inline bool importTileFromImage(const fs::path &path, tile_t &outTile, std::stri
     return true;
 }
 
+// Vrai si tous les pixels RGBA d'une case w x h sont strictement
+// identiques (meme rouge/vert/bleu/alpha) -- utilise par les imports
+// par lot (tuiles et sprites) pour detecter une case "vide" (fond uni,
+// ou entierement transparente) et l'ignorer plutot que d'ecraser une
+// tuile/un sprite existant avec du contenu vide.
+inline bool isCellUniformRGBA(const unsigned char *pixels, int stride, int w, int h)
+{
+    const unsigned char *first = pixels;
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+        {
+            const unsigned char *p = pixels + (size_t)y * stride + (size_t)x * 4;
+            if (p[0] != first[0] || p[1] != first[1] || p[2] != first[2] || p[3] != first[3])
+                return false;
+        }
+    return true;
+}
+
 // Resultat d'un import par lot -- rempli meme si imported==0, pour que
 // l'appelant puisse afficher un recapitulatif utile dans tous les cas
 // (y compris "tout etait deja hors plage").
@@ -164,8 +182,9 @@ struct BatchImportResult
     int leftoverPixelsY = 0;        // pixels ignores en bas (hauteur pas multiple de 8)
     int startTile = 0;
     int imported = 0;               // nombre de tuiles effectivement ecrites
-    int endTile = -1;               // dernier index ecrit (startTile+imported-1), -1 si aucune
+    int endTile = -1;               // dernier index du lot traite (ecrit ou ignore comme case vide), -1 si aucun
     int skippedOverflow = 0;        // cases de la grille qui auraient depasse la tuile 255
+    int skippedUniform = 0;         // cases "vides" (tous pixels identiques) ignorees, dans la plage traitee
 };
 
 // Importe TOUTE une image comme une grille de tuiles 8x8, sans aucun
@@ -174,10 +193,14 @@ struct BatchImportResult
 // naturel de lecture (gauche->droite, puis haut->bas), a partir de
 // startTile et en avançant d'un cran par case. S'arrete a la tuile 255
 // (une seule banque a la fois -- pas de debordement vers la banque
-// suivante). N'ecrit rien si le fichier ne peut pas etre charge ; ecrit
-// direct dans tiles_data[bank][...] pour chaque case traitee sinon
-// (comme le reste de ce fichier -- l'appelant reconstruit les atlas
-// et gere st.dirty).
+// suivante). Une case dont tous les pixels sont identiques (fond uni ou
+// entierement transparent -- typiquement une case vide d'une planche de
+// sprites/tuiles) est ignoree : rien n'est ecrit pour cette tuile, elle
+// garde son contenu precedent, et elle compte dans skippedUniform plutot
+// que dans imported. N'ecrit rien si le fichier ne peut pas etre charge ;
+// ecrit direct dans tiles_data[bank][...] pour chaque case non-vide du
+// lot traite sinon (comme le reste de ce fichier -- l'appelant
+// reconstruit les atlas et gere st.dirty).
 inline bool importTilesBatchFromImage(const fs::path &path, int bank, int startTile, BatchImportResult &result, std::string &err)
 {
     std::vector<uint8_t> buf;
@@ -198,7 +221,6 @@ inline bool importTilesBatchFromImage(const fs::path &path, int bank, int startT
     int totalCells = result.cols * result.rows;
     int available = (startTile <= 255) ? (256 - startTile) : 0;
     int toImport = std::min(totalCells, available);
-    result.imported = toImport;
     result.skippedOverflow = totalCells - toImport;
 
     int stride = w * 4;
@@ -207,7 +229,9 @@ inline bool importTilesBatchFromImage(const fs::path &path, int bank, int startT
         int r = n / result.cols, c = n % result.cols;
         int idx = startTile + n;
         const unsigned char *cellStart = data + (size_t)(r * 8) * stride + (size_t)(c * 8) * 4;
+        if (isCellUniformRGBA(cellStart, stride, 8, 8)) { result.skippedUniform++; continue; }
         encodeTileFromRGBA8x8(cellStart, stride, tiles_data[bank][idx]);
+        result.imported++;
     }
     stbi_image_free(data);
 

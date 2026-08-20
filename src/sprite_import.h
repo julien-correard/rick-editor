@@ -121,16 +121,38 @@ struct SpriteBatchImportResult
     int leftoverPixelsY = 0;        // pixels ignores en bas (hauteur pas multiple de 21)
     int startSprite = 0;
     int imported = 0;               // nombre de sprites effectivement ecrits
-    int endSprite = -1;             // dernier index ecrit, -1 si aucun
+    int endSprite = -1;             // dernier index du lot traite (ecrit ou ignore comme case vide), -1 si aucun
     int skippedOverflow = 0;        // cases de la grille qui auraient depasse le sprite 212
+    int skippedUniform = 0;         // cases "vides" (pixels identiques ou entierement transparentes) ignorees
 };
+
+// Vrai si tous les pixels d'une case ont un alpha sous le seuil de
+// transparence des sprites -- une case "vide" en PNG a souvent un RGB
+// residuel incoherent sous la transparence (artefact d'export courant),
+// donc l'egalite stricte de isCellUniformRGBA() ne suffit pas a la
+// detecter ; ce test-ci la complete pour les sprites uniquement (les
+// tuiles n'ont pas de notion de transparence).
+inline bool isCellFullyTransparent(const unsigned char *pixels, int stride, int w, int h)
+{
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+        {
+            const unsigned char *p = pixels + (size_t)y * stride + (size_t)x * 4;
+            if (p[3] >= SPRITE_ALPHA_THRESHOLD) return false;
+        }
+    return true;
+}
 
 // Importe TOUTE une image comme une grille de sprites 32x21, sans
 // aucun rééchantillonnage : chaque case exacte devient un sprite, dans
 // l'ordre naturel de lecture (gauche->droite, puis haut->bas), a partir
 // de startSprite. S'arrete au dernier sprite (SPRITES_NBR_SPRITES-1) --
 // meme logique que importTilesBatchFromImage() dans tile_import.h, sans
-// notion de banque ici (il n'y a qu'un seul tableau sprites_data).
+// notion de banque ici (il n'y a qu'un seul tableau sprites_data). Une
+// case "vide" (tous les pixels strictement identiques, OU entierement
+// transparente) est ignoree : rien n'est ecrit pour ce sprite, il garde
+// son contenu precedent, et elle compte dans skippedUniform plutot que
+// dans imported.
 inline bool importSpritesBatchFromImage(const fs::path &path, int startSprite, SpriteBatchImportResult &result, std::string &err)
 {
     std::vector<uint8_t> buf;
@@ -152,7 +174,6 @@ inline bool importSpritesBatchFromImage(const fs::path &path, int startSprite, S
     int totalCells = result.cols * result.rows;
     int available = (startSprite <= SPRITES_NBR_SPRITES - 1) ? (SPRITES_NBR_SPRITES - startSprite) : 0;
     int toImport = std::min(totalCells, available);
-    result.imported = toImport;
     result.skippedOverflow = totalCells - toImport;
 
     int stride = w * 4;
@@ -161,7 +182,10 @@ inline bool importSpritesBatchFromImage(const fs::path &path, int startSprite, S
         int r = n / result.cols, c = n % result.cols;
         int idx = startSprite + n;
         const unsigned char *cellStart = data + (size_t)(r * SPRITE_H) * stride + (size_t)(c * SPRITE_W) * 4;
+        if (isCellUniformRGBA(cellStart, stride, SPRITE_W, SPRITE_H) || isCellFullyTransparent(cellStart, stride, SPRITE_W, SPRITE_H))
+        { result.skippedUniform++; continue; }
         encodeSpriteFromRGBA(cellStart, stride, sprites_data[idx]);
+        result.imported++;
     }
     stbi_image_free(data);
 

@@ -137,6 +137,7 @@ struct BlockEditorState
     int selectedBlock = -1;  // -1 = nothing selected yet
     int selectedCell = 0;    // 0-15, which of the block's 16 tile slots a picked tile goes into
     bool swapMode = false;   // "Swap with..." armed -- next block clicked in the grid swaps with selectedBlock
+    bool copyMode = false;   // "Copy to..." armed -- next block clicked in the grid is overwritten with selectedBlock's composition
 };
 
 // State for the standalone Sprite Editor window -- mirrors TileEditorState,
@@ -1098,6 +1099,9 @@ int main(int argc, char *argv[])
                             msg += std::to_string(br.skippedOverflow) + " tile(s) skipped: ran past tile 255 "
                                 "(start tile " + std::to_string(br.startTile) + " + " + std::to_string(br.cols * br.rows)
                                 + " image tiles overflows the bank).\n";
+                        if (br.skippedUniform > 0)
+                            msg += std::to_string(br.skippedUniform) + " tile(s) skipped: empty cell (all pixels "
+                                "the same color) -- left whatever was already at that tile.\n";
                         if (br.leftoverPixelsX > 0 || br.leftoverPixelsY > 0)
                             msg += "Image size isn't a multiple of 8 -- ignored " + std::to_string(br.leftoverPixelsX)
                                 + "px on the right and " + std::to_string(br.leftoverPixelsY) + "px at the bottom.";
@@ -1149,6 +1153,9 @@ int main(int argc, char *argv[])
                                 + std::to_string(SPRITES_NBR_SPRITES - 1) + " (start sprite "
                                 + std::to_string(br.startSprite) + " + " + std::to_string(br.cols * br.rows)
                                 + " image sprites overflows the table).\n";
+                        if (br.skippedUniform > 0)
+                            msg += std::to_string(br.skippedUniform) + " sprite(s) skipped: empty cell (all pixels "
+                                "the same color, or fully transparent) -- left whatever was already at that sprite.\n";
                         if (br.leftoverPixelsX > 0 || br.leftoverPixelsY > 0)
                             msg += "Image size isn't a multiple of " + std::to_string(SPRITE_W) + "x"
                                 + std::to_string(SPRITE_H) + " -- ignored " + std::to_string(br.leftoverPixelsX)
@@ -1489,6 +1496,9 @@ int main(int argc, char *argv[])
             if (blockEditor.swapMode)
                 ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "Swap mode: click a block on the left to swap "
                                                                      "with block %d.", blockEditor.selectedBlock);
+            if (blockEditor.copyMode)
+                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f), "Copy mode: click a block on the left to "
+                                                                    "overwrite it with block %d.", blockEditor.selectedBlock);
 
             float detailW = 280.0f;
             ImGui::BeginChild("##blockGrid", ImVec2(-detailW, 0), true);
@@ -1505,9 +1515,22 @@ int main(int argc, char *argv[])
                     float u1 = u0 + 1.0f / ATLAS_BLOCKS_PER_ROW;
                     float v1 = v0 + 1.0f / ATLAS_BLOCKS_PER_ROW;
 
+                    // Whether a style color was pushed for THIS button is
+                    // captured up front and used as-is for the matching
+                    // pop below -- never re-derived from swapMode/copyMode
+                    // after the click handler runs, since that handler can
+                    // itself flip those flags off (e.g. a successful swap
+                    // disarms swapMode). Re-checking post-click would pop
+                    // based on a value that changed since the push,
+                    // silently unbalancing ImGui's style color stack --
+                    // exactly what was crashing the swap feature before.
                     bool selected = (b == blockEditor.selectedBlock);
+                    bool pushedColor = true;
                     if (selected) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.55f, 0.95f, 1.0f));
                     else if (blockEditor.swapMode) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.45f, 0.10f, 1.0f));
+                    else if (blockEditor.copyMode) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.45f, 0.20f, 1.0f));
+                    else pushedColor = false;
+
                     if (ImGui::ImageButton("##blk", blkTexId, ImVec2(thumb, thumb), ImVec2(u0, v0), ImVec2(u1, v1)))
                     {
                         if (blockEditor.swapMode)
@@ -1521,14 +1544,30 @@ int main(int argc, char *argv[])
                             }
                             blockEditor.swapMode = false;
                         }
+                        else if (blockEditor.copyMode)
+                        {
+                            if (b != blockEditor.selectedBlock)
+                            {
+                                std::memcpy(map_blocks[b], map_blocks[blockEditor.selectedBlock], sizeof(map_blocks[b]));
+                                rebuildBlockAtlasOnly(renderer, tileAtlas, blockAtlas, 1);
+                                rebuildBlockAtlasOnly(renderer, tileAtlas, blockAtlas, 2);
+                                st.dirty = true;
+                            }
+                            blockEditor.copyMode = false;
+                        }
                         else
                         {
                             blockEditor.selectedBlock = b;
                             blockEditor.selectedCell = 0;
                         }
                     }
-                    if (selected || blockEditor.swapMode) ImGui::PopStyleColor();
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip(blockEditor.swapMode ? "Swap with block %d" : "Block %d", b);
+                    if (pushedColor) ImGui::PopStyleColor();
+                    if (ImGui::IsItemHovered())
+                    {
+                        if (blockEditor.swapMode) ImGui::SetTooltip("Swap with block %d", b);
+                        else if (blockEditor.copyMode) ImGui::SetTooltip("Copy into block %d", b);
+                        else ImGui::SetTooltip("Block %d", b);
+                    }
                     float nextRight = ImGui::GetItemRectMax().x + beStyle.ItemSpacing.x + ImGui::GetItemRectSize().x;
                     if (b != 255 && nextRight < beWindowRight)
                         ImGui::SameLine();
@@ -1578,16 +1617,42 @@ int main(int argc, char *argv[])
 
                     ImGui::Spacing();
                     ImGui::Text("Selected cell: %d (tile %d)", blockEditor.selectedCell, std::clamp(cells[blockEditor.selectedCell], 0, 255));
+                    // These 3 buttons can together exceed this panel's
+                    // fixed width (280px, or narrower still if the user
+                    // shrinks the window) -- SameLine() alone doesn't
+                    // wrap, it just lets a button run off the edge,
+                    // unclickable. Same wrap-if-needed idiom as the top
+                    // toolbar: SameLine() to tentatively continue the
+                    // row, then NewLine() overrides it if that pushed
+                    // past the panel's right edge.
+                    float detailRight = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
+                    auto wrapDetail = [&]()
+                    {
+                        ImGui::SameLine();
+                        if (ImGui::GetCursorScreenPos().x > detailRight) ImGui::NewLine();
+                    };
                     if (ImGui::SmallButton("Clear block (all tile 0)"))
                     {
                         for (int i = 0; i < 16; i++) cells[i] = 0;
                         blockChanged = true;
                     }
-                    ImGui::SameLine();
+                    wrapDetail();
                     if (ImGui::SmallButton(blockEditor.swapMode ? "Cancel swap" : "Swap with..."))
+                    {
                         blockEditor.swapMode = !blockEditor.swapMode;
+                        if (blockEditor.swapMode) blockEditor.copyMode = false; // mutually exclusive armed modes
+                    }
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Click, then pick another block on the left to "
                                                                    "swap the two blocks' tile compositions");
+                    wrapDetail();
+                    if (ImGui::SmallButton(blockEditor.copyMode ? "Cancel copy" : "Copy to..."))
+                    {
+                        blockEditor.copyMode = !blockEditor.copyMode;
+                        if (blockEditor.copyMode) blockEditor.swapMode = false;
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Click, then pick another block on the left to "
+                                                                   "overwrite it with this block's tile composition "
+                                                                   "(this block itself is left unchanged)");
 
                     ImGui::Separator();
                     ImGui::TextWrapped("Tile picker (bank %d) -- click to place into the selected cell:", blockEditor.bank);

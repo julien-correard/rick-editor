@@ -62,31 +62,43 @@ int main()
     std::printf(ok ? "OK: single sprite import round-trips exactly (incl. transparency)\n" : "FAIL single\n");
 
     // --- Test 2 : import par lot, grille 2x1 de sprites (64x21), avec
-    // marqueurs distincts pour verifier l'absence de melange ---
+    // marqueurs distincts pour verifier l'absence de melange. Motifs
+    // non-uniformes (pas juste une couleur unie par sprite) : depuis
+    // l'ajout du saut des cases "vides" (tous pixels identiques), une
+    // case unie serait desormais ignoree plutot qu'importee -- ce
+    // test verifie le cas normal (contenu reel), le cas vide est
+    // couvert par test_sprite_batch_empty.cpp separement.
     int W2 = SPRITE_W * 2, H2 = SPRITE_H;
     std::vector<int> grid(W2 * H2, -1);
     for (int y = 0; y < H2; y++)
     for (int x = 0; x < W2; x++)
     {
         int col = x / SPRITE_W; // 0 ou 1
-        grid[y * W2 + x] = (col == 0) ? 3 : 12;
+        int lx = x % SPRITE_W;
+        int base = (col == 0) ? 3 : 12;
+        grid[y * W2 + x] = ((lx + y) % 5 == 0) ? base + 1 : base; // motif variable, jamais uniforme
     }
     fs::path p2 = fs::temp_directory_path() / "rickeditor_test_sprite_batch.tga";
     writeTestTga(p2.string(), W2, H2, grid.data());
 
     SpriteBatchImportResult br;
     if (!importSpritesBatchFromImage(p2, 200, br, err)) { std::printf("FAIL batch import: %s\n", err.c_str()); return 1; }
-    std::printf("batch: cols=%d rows=%d imported=%d skipped=%d endSprite=%d\n", br.cols, br.rows, br.imported, br.skippedOverflow, br.endSprite);
-    if (br.cols != 2 || br.rows != 1 || br.imported != 2 || br.skippedOverflow != 0)
+    std::printf("batch: cols=%d rows=%d imported=%d skipped=%d skippedUniform=%d endSprite=%d\n",
+                br.cols, br.rows, br.imported, br.skippedOverflow, br.skippedUniform, br.endSprite);
+    if (br.cols != 2 || br.rows != 1 || br.imported != 2 || br.skippedOverflow != 0 || br.skippedUniform != 0)
     { ok = false; std::printf("FAIL: unexpected batch geometry/counts\n"); }
 
     Uint32 outA[SPRITE_W * SPRITE_H], outB[SPRITE_W * SPRITE_H];
     decode_sprite(200, outA);
     decode_sprite(201, outB);
-    for (int i = 0; i < SPRITE_W * SPRITE_H; i++)
+    for (int y = 0; y < SPRITE_H; y++)
+    for (int x = 0; x < SPRITE_W; x++)
     {
-        if (outA[i] != colOf(3)) { ok = false; std::printf("MISMATCH batch sprite200 px %d: got 0x%08x\n", i, outA[i]); }
-        if (outB[i] != colOf(12)) { ok = false; std::printf("MISMATCH batch sprite201 px %d: got 0x%08x\n", i, outB[i]); }
+        int i = y * SPRITE_W + x;
+        uint32_t expA = colOf(((x + y) % 5 == 0) ? 4 : 3);
+        uint32_t expB = colOf(((x + y) % 5 == 0) ? 13 : 12);
+        if (outA[i] != expA) { ok = false; std::printf("MISMATCH batch sprite200 px %d: got 0x%08x\n", i, outA[i]); }
+        if (outB[i] != expB) { ok = false; std::printf("MISMATCH batch sprite201 px %d: got 0x%08x\n", i, outB[i]); }
     }
 
     // --- Test 3 : depassement en fin de table (SPRITES_NBR_SPRITES-1 = 212) ---

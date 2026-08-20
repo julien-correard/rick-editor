@@ -177,6 +177,12 @@ Editor, Sprite Editor, and Text Editor sections below).
   handling -- not part of the CMake build; compile/run manually: `g++
   -std=c++17 -Iinclude -Isrc -Ithird_party src/test_tile_batch_import.cpp
   src/dat_tilesST.c -o test_tile_batch_import && ./test_tile_batch_import`).
+- `src/test_tile_batch_empty.cpp` -- standalone test for the batch tile
+  import's empty-cell skip (imported vs. skipped counts, confirms a
+  skipped tile's data is left byte-for-byte untouched -- not part of the
+  CMake build; compile/run manually: `g++ -std=c++17 -Iinclude -Isrc
+  -Ithird_party src/test_tile_batch_empty.cpp src/dat_tilesST.c -o
+  test_tile_batch_empty && ./test_tile_batch_empty`).
 - `src/test_sprite_import.cpp` -- standalone test for single + batch
   sprite import (round-trip through `decode_sprite()` incl.
   transparency, no-bleed between batch-imported sprites, end-of-table
@@ -184,6 +190,13 @@ Editor, Sprite Editor, and Text Editor sections below).
   -std=c++17 -Iinclude -Isrc -Ithird_party src/test_sprite_import.cpp
   src/dat_tilesST.c src/dat_spritesST.c -o test_sprite_import &&
   ./test_sprite_import`).
+- `src/test_sprite_batch_empty.cpp` -- standalone test for the batch
+  sprite import's empty/transparent-cell skip (uniform opaque cell,
+  noisy-but-transparent cell, normal cell -- not part of the CMake
+  build; compile/run manually: `g++ -std=c++17 -Iinclude -Isrc
+  -Ithird_party src/test_sprite_batch_empty.cpp src/dat_tilesST.c
+  src/dat_spritesST.c -o test_sprite_batch_empty &&
+  ./test_sprite_batch_empty`).
 - `src/test_sprite_persist.cpp` -- standalone round-trip test for the
   RKM8 `.map` format (sprite graphics -- not part of the CMake build;
   compile/run manually: `g++ -std=c++17 -Iinclude -Isrc -Ithird_party
@@ -199,6 +212,11 @@ Editor, Sprite Editor, and Text Editor sections below).
   block-swap logic (not part of the CMake build; compile/run manually:
   `g++ -std=c++17 -Iinclude -Isrc src/test_block_swap.cpp -o
   test_block_swap && ./test_block_swap`).
+- `src/test_block_copy.cpp` -- standalone test for the Block Editor's
+  block-copy logic (destination gets source's content, source unchanged
+  -- not part of the CMake build; compile/run manually: `g++
+  -std=c++17 -Iinclude -Isrc src/test_block_copy.cpp -o
+  test_block_copy && ./test_block_copy`).
 - `src/test_screens_text.cpp` -- standalone test for `parseImapText()`
   (decodes the "amazon" text and checks the first line reads "SOUTH
   AMERICA 1945" exactly, blank-line detection, all 5 texts decode
@@ -930,11 +948,21 @@ currently selected. See `src/tile_import.h`.
   done. **Selecting a tile in the grid also sets the batch start tile**
   to that tile's number (still freely editable in the field afterward --
   it's just a convenient default, e.g. select tile 40 then batch-import
-  starting there without retyping "40"). Verified against `decode_tile()`
+  starting there without retyping "40"). **Empty cells are skipped
+  automatically**: a cell where every pixel is exactly the same color
+  (a common way sprite sheets/tile sheets pad unused grid slots) is left
+  untouched -- whatever was already at that tile stays, rather than
+  getting overwritten with a blank tile -- and counts toward a
+  "N tile(s) skipped: empty cell" line in the summary rather than
+  toward the imported count (`isCellUniformRGBA()`, shared with the
+  Sprite Editor's batch import below). Verified against `decode_tile()`
   with a dedicated test that
   checks for bleed between adjacent source tiles (a marker pixel in one
   corner of each source tile, decoded back and checked pixel-by-pixel),
-  plus the tile-255 overflow case, `src/test_tile_batch_import.cpp`.
+  plus the tile-255 overflow case, `src/test_tile_batch_import.cpp`, and
+  a separate test for the empty-cell skip itself (imported vs. skipped
+  counts, and confirming a skipped cell's tile is byte-for-byte
+  untouched), `src/test_tile_batch_empty.cpp`.
 - Editing a tile's graphic here (single or batch) immediately rebuilds
   that bank's tile *and* block atlas textures (blocks are a baked
   snapshot of the tile atlas, not a live view of it -- see
@@ -1055,9 +1083,17 @@ not a second copy of the data.
   entire tile composition with the selected block's
   (`std::swap(map_blocks[a], map_blocks[b])` -- swaps the two `int[16]`
   arrays in place, verified not to disturb any other block with a
-  dedicated throwaway test during development). Candidate blocks are
+  dedicated test, `src/test_block_swap.cpp`). Candidate blocks are
   tinted amber while swap mode is armed; clicking the already-selected
   block, or toggling the button again, cancels without swapping.
+- **Copy to...** works the same way (button label changes to "Cancel
+  copy", candidates tinted green instead of amber) but one-directional:
+  the next block clicked is overwritten with the selected block's
+  composition (`memcpy`), while the selected block itself is left
+  untouched -- unlike Swap, which changes both. Verified with its own
+  test, `src/test_block_copy.cpp` (destination gets the source's exact
+  content, source is unchanged, no other block affected). Swap and Copy
+  are mutually exclusive -- arming one disarms the other.
 - Cell/picker thumbnails are border color-coded by hazard flags too --
   see the Tile Editor section above for what each color means.
 - Any edit here rebuilds *both* banks' block atlas textures right away
@@ -1065,6 +1101,32 @@ not a second copy of the data.
   since the tile atlases themselves didn't change, just how blocks are
   assembled from them), so changes show up immediately in the Block
   Editor, the Block Palette, and the map itself.
+- **Fixed a real crash in Swap** (present through at least one shipped
+  build): the per-block selection/swap-candidate highlight pushed an
+  ImGui style color conditionally (`if (selected) ... else if
+  (swapMode) PushStyleColor(...)`), then popped it by re-checking
+  `selected || swapMode` *after* the click handler had already run for
+  that same button -- and a successful swap sets `swapMode = false` as
+  part of completing it. So the exact case of "swap mode armed, click a
+  *different* block" pushed a color and then, because `swapMode` had
+  just flipped to false, skipped the matching pop, leaving ImGui's style
+  color stack permanently unbalanced by one and asserting/crashing soon
+  after. The fix (and the same pattern used for Copy's highlight):
+  capture a plain `bool pushedColor` *before* the button's click handler
+  can mutate any mode flags, and pop based on that captured value, never
+  by re-deriving the condition afterward. Caught by actually driving the
+  UI end-to-end (`xdotool` clicks against a real running build under
+  Xvfb, not just the data-level swap logic in isolation) -- worth
+  remembering next time a click handler here mutates state that a
+  nearby style push/pop also depends on.
+- **Also fixed while investigating**: the "Clear block"/"Swap
+  with..."/"Copy to..." button row could overflow this panel's fixed
+  280px width with `SameLine()` alone (which doesn't wrap -- it just lets
+  a button run off the edge, unclickable, exactly what had silently made
+  Copy unreachable in the first version of that button). Same wrap-if-
+  needed idiom as the top toolbar (`wrapDetail()` here): `SameLine()` to
+  tentatively continue the row, `NewLine()` overrides it if that pushed
+  past the panel's right edge.
 
 **Persistence:** `map_blocks` round-trips through `.map` files (a new
 "RKM7" format, extending RKM6 with `0x100 * 16 * sizeof(int)` bytes of
@@ -1122,8 +1184,15 @@ choices:
   -- no wraparound); a leftover partial row/column of pixels (image size
   not an exact multiple of 32x21) is ignored rather than rejecting the
   image. Selecting a sprite in the grid also sets the batch start sprite
-  to that number, same convenience as the Tile Editor. A summary popup
-  shows what happened.
+  to that number, same convenience as the Tile Editor. **Empty cells are
+  skipped** just like the Tile Editor's batch import (same
+  `isCellUniformRGBA()`, all pixels exactly one color), plus a sprite-
+  specific case on top: a cell that's **entirely transparent** is also
+  skipped even if its underlying RGB noise isn't uniform (common PNG
+  export artifact -- garbage color data hiding under alpha 0), via
+  `isCellFullyTransparent()`. Either way, the sprite already there is
+  left untouched and the skip is called out in the summary popup rather
+  than counted as imported.
 - Any import (single or batch) rebuilds the sprite atlas texture right
   away (`rebuildSpriteAtlas()` in `editor.cpp`), so changes show up
   immediately here and in the map canvas/Sprite Tools windows that also
@@ -1136,7 +1205,11 @@ between the two sprites, and the end-of-table overflow case -- same
 methodology as the tile import tests, using a hand-written TGA encoder
 (32bpp with a native alpha channel, simpler to get exactly right for a
 test than a BMP with `BI_BITFIELDS` masks, which turned out to need more
-care than expected during development).
+care than expected during development). The empty/transparent-cell skip
+has its own test, `src/test_sprite_batch_empty.cpp` -- a uniform opaque
+cell, a cell with noisy RGB but full transparency, and a normal cell,
+confirming only the normal one imports and the other two leave their
+sprite slot untouched.
 
 **Persistence:** `sprites_data` round-trips through `.map` files (a new
 "RKM8" format, extending RKM7 with `SPRITES_NBR_SPRITES * sizeof(sprite_t)`
