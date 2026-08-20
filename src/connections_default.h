@@ -10,6 +10,7 @@
 
 struct SubmapRaw { uint16_t page, bnum, connect, mark; };
 struct ConnectRaw { uint8_t dir, rowout, submap, rowin; };
+struct MapStartRaw { uint16_t x, y, row, submap; };
 
 static const std::array<SubmapRaw, 47> defaultSubmapsRaw = {{
   {0, 0, 0, 0}, // submap 0
@@ -744,6 +745,18 @@ static const std::array<MarkRaw, 523> defaultMarksRaw = {{
   {32, 54, 17, 235, 128},
   {32, 55, 31, 238, 128},
   {255, 0, 0, 0, 0},
+}};
+
+// Stock per-map start positions (map_maps), from dat_maps.c.
+// {x, y, row, submap} -- tune strings omitted (they are pointer-based
+// in the ELF and not something the editor patches).
+static const int MAP_NBR_MAPS = 5;
+static const std::array<MapStartRaw, MAP_NBR_MAPS> defaultMapStartsRaw = {{
+  {0x0008, 0x008b, 0x0008, 0x0000}, // map 0: tune0
+  {0x0008, 0x008b, 0x0068, 0x0009}, // map 1: tune1
+  {0x0010, 0x008b, 0x0010, 0x0014}, // map 2: tune2
+  {0x0010, 0x008b, 0x0010, 0x0026}, // map 3: tune3
+  {0x0074, 0x00c8, 0x0008, 0x0026}, // map 4: tune4
 }};
 
 // Entity type -> sprite/step art data, from the real xrick source's

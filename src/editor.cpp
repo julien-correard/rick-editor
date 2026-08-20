@@ -1973,6 +1973,67 @@ int main(int argc, char *argv[])
                                 "(direction just says which way through it counts as a trigger).");
             ImGui::Separator();
 
+            // --- Per-map start positions (xrick's map_maps) ---
+            if (ImGui::CollapsingHeader("Map Start Positions"))
+            {
+                ImGui::Indent();
+                ImGui::TextWrapped("Each of the 5 maps (levels) has a start position that controls "
+                                   "where Rick appears initially: pixel coordinates (x, y), the "
+                                   "first displayed tile-row in game, and the starting submap "
+                                   "index. Rick's actual screen row depends on both the scroll "
+                                   "position and his pixel Y offset. These values come from "
+                                   "xrick's map_maps[] array (dat_maps.c).");
+                ImGui::Separator();
+                static const char *mapNames[] = {"Map 0", "Map 1", "Map 2", "Map 3", "Map 4"};
+                for (int m = 0; m < MAP_NBR_MAPS; m++)
+                {
+                    ImGui::PushID(2000 + m);
+                    MapStartInfo &ms = connections.mapStarts[m];
+                    ImGui::SetNextItemWidth(120);
+                    ImGui::DragInt("X", &ms.x, 1.0f, 0, 32767);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Pixel X position where Rick spawns");
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(120);
+                    ImGui::DragInt("Y", &ms.y, 1.0f, 0, 32767);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Pixel Y position where Rick spawns");
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("  %s", mapNames[m]);
+
+                    int sm = ms.submap;
+                    int base = (sm >= 0 && sm < MAP_NBR_SUBMAPS) ? submapStartRow(connections.submaps[sm]) : 0;
+                    int rawRow = ms.row - base;
+                    int firstVisible = ms.row + 8;
+                    ImGui::SetNextItemWidth(120);
+                    if (ImGui::DragInt("Row", &firstVisible, 1.0f, 8, MAP_TILE_ROWS - 1))
+                        ms.row = firstVisible - 8;
+                    if (ImGui::IsItemHovered())
+                    {
+                        int heroFeetRow = firstVisible + (ms.y + entDataTable[1].h) / 8 - 8;
+                        ImGui::SetTooltip("First tile-row displayed in game.\n"
+                                          "Rick's feet appear at tile row %d.\n"
+                                          "Raw map_frow: %d.", heroFeetRow, rawRow);
+                    }
+                    if (rawRow % 4 != 0)
+                    {
+                        ImGui::SameLine();
+                        ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "!");
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Raw map_frow %d is not a multiple of 4!\n"
+                                              "map_expand() will load misaligned tiles,\n"
+                                              "causing sprite/tile desync in-game.", rawRow);
+                    }
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(120);
+                    ImGui::DragInt("Submap", &ms.submap, 1.0f, 0, MAP_NBR_SUBMAPS - 1);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Starting submap index (0-%d)", MAP_NBR_SUBMAPS - 1);
+
+                    ImGui::PopID();
+                    if (m < MAP_NBR_MAPS - 1) ImGui::Separator();
+                }
+                ImGui::Unindent();
+            }
+            ImGui::Separator();
+
             if (ImGui::CollapsingHeader("Diagnostics"))
             {
                 ImGui::Indent();

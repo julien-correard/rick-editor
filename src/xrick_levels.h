@@ -52,6 +52,17 @@ static const int SUBMAP_END_OF_LEVEL = 0xff;
 
 struct SubmapInfo { int page = 0, bnum = 0, mark = 0; };
 
+// Per-map player start position (matches xrick's map_t: {x, y, row,
+// submap, tune}). x/y are pixel coordinates, row is the initial
+// visible tile-row in absolute coordinates (submapStartRow + map_frow),
+// submap is the starting submap index. The tune field (music file
+// pointer) is stored in the ELF but not editable here since it
+// requires pointer relocation. When patching, row is converted back
+// to the raw submap-local map_frow = row - submapStartRow(submap).
+// The raw value must be a multiple of 4 for map_expand() alignment;
+// non-aligned values are rounded down at patch time.
+struct MapStartInfo { int x = 0, y = 0, row = 0, submap = 0; };
+
 // dir: 0 = going down, 1 = going up.
 // rowAbs: absolute row (this editor's coordinate space) of the trigger,
 //   on the submap that owns this exit.
@@ -65,6 +76,7 @@ struct ConnectionsData
     bool loaded = false;
     std::array<SubmapInfo, MAP_NBR_SUBMAPS> submaps;
     std::array<std::vector<ConnectEntry>, MAP_NBR_SUBMAPS> exits; // terminator implicit, not stored
+    std::array<MapStartInfo, MAP_NBR_MAPS> mapStarts;
 
     // Filled by repackConnections(), consumed when patching a binary.
     std::vector<uint8_t> packedSubmaps;
@@ -78,11 +90,18 @@ static inline int submapStartRow(const SubmapInfo &s) { return s.bnum / 2; }
 // Decodes raw/local submap + connect arrays (as read from an ELF binary,
 // or from the compiled-in defaults) into the editor's absolute-row model.
 inline ConnectionsData decodeConnectionsFromRaw(const std::array<SubmapRaw, MAP_NBR_SUBMAPS> &rawSubmaps,
-                                                 const std::array<ConnectRaw, MAP_NBR_CONNECT> &rawConnect)
+                                                 const std::array<ConnectRaw, MAP_NBR_CONNECT> &rawConnect,
+                                                 const std::array<MapStartRaw, MAP_NBR_MAPS> &rawMapStarts)
 {
     ConnectionsData out;
     for (int i = 0; i < MAP_NBR_SUBMAPS; i++)
         out.submaps[i] = {rawSubmaps[i].page, rawSubmaps[i].bnum, rawSubmaps[i].mark};
+    for (int i = 0; i < MAP_NBR_MAPS; i++)
+    {
+        int sm = rawMapStarts[i].submap;
+        int base = (sm >= 0 && sm < MAP_NBR_SUBMAPS) ? submapStartRow(out.submaps[sm]) : 0;
+        out.mapStarts[i] = {(int)rawMapStarts[i].x, (int)rawMapStarts[i].y, (int)rawMapStarts[i].row + base, sm};
+    }
 
     for (int i = 0; i < MAP_NBR_SUBMAPS; i++)
     {
@@ -110,7 +129,7 @@ inline ConnectionsData decodeConnectionsFromRaw(const std::array<SubmapRaw, MAP_
 
 inline ConnectionsData defaultConnections()
 {
-    return decodeConnectionsFromRaw(defaultSubmapsRaw, defaultConnectRaw);
+    return decodeConnectionsFromRaw(defaultSubmapsRaw, defaultConnectRaw, defaultMapStartsRaw);
 }
 
 inline bool loadXrickConnections(const fs::path &path, ConnectionsData &out, std::string &err)
@@ -150,7 +169,29 @@ inline bool loadXrickConnections(const fs::path &path, ConnectionsData &out, std
     for (int i = 0; i < MAP_NBR_CONNECT; i++)
         rawConnect[i] = {buf[coff + i * 4 + 0], buf[coff + i * 4 + 1], buf[coff + i * 4 + 2], buf[coff + i * 4 + 3]};
 
-    out = decodeConnectionsFromRaw(rawSubmaps, rawConnect);
+    out = decodeConnectionsFromRaw(rawSubmaps, rawConnect, defaultMapStartsRaw);
+
+    // Try to load map_maps (per-map start positions) from the ELF.
+    // Each entry is 12 bytes: {U16 x, U16 y, U16 row, U16 submap, char *tune}.
+    // We read the 8-byte numeric portion and skip the 4-byte tune pointer.
+    size_t moff = 0, msize = 0;
+    if (elf32_find_symbol_file_offset(buf, "map_maps", moff, msize, err))
+    {
+        if (msize >= (size_t)MAP_NBR_MAPS * 12)
+        {
+            for (int i = 0; i < MAP_NBR_MAPS; i++)
+            {
+                uint16_t x, y, row, submap;
+                std::memcpy(&x, &buf[moff + i * 12 + 0], 2);
+                std::memcpy(&y, &buf[moff + i * 12 + 2], 2);
+                std::memcpy(&row, &buf[moff + i * 12 + 4], 2);
+                std::memcpy(&submap, &buf[moff + i * 12 + 6], 2);
+                int sm = submap;
+                int base = (sm >= 0 && sm < MAP_NBR_SUBMAPS) ? submapStartRow(out.submaps[sm]) : 0;
+                out.mapStarts[i] = {x, y, (int)row + base, sm};
+            }
+        }
+    }
     err.clear();
     return true;
 }
@@ -353,24 +394,27 @@ inline BlockShiftFixResult fixMisalignedBlockRun(ConnectionsData &conn)
     return res;
 }
 
-// --- .map v2: level layout + screen connections in one file ---------
+// --- .map v3: level layout + screen connections + map starts in one file --
 //
-// Format ("RKM2" magic):
-//   header: magic[4]="RKM2", uint32 bnumsCount(=MAP_COUNT), uint32 submapCount(=47)
+// Format ("RKM3" magic):
+//   header: magic[4]="RKM3", uint32 bnumsCount(=MAP_COUNT), uint32 submapCount(=47), uint32 mapCount(=5)
 //   MAP_COUNT * int32          -- map_bnums, same encoding as v1
 //   per submap (submapCount times):
 //     int32 page, int32 bnum, int32 mark, int32 exitCount
 //     exitCount * { int32 dir, int32 rowAbs, int32 targetSubmap, int32 targetRowAbs }
+//   per map (mapCount times):
+//     int32 x, int32 y, int32 row, int32 submap
 //
-// Old v1 files ("RKMP" magic, bnums only) still open fine -- connections
-// are simply left as they were (not reset) when loading one.
-struct MapFileHeaderV2 { char magic[4]; uint32_t bnumsCount; uint32_t submapCount; };
+// Old v2 files ("RKM2" magic, bnums + connections only) still open
+// fine -- map starts are left at their defaults. Old v1 files ("RKMP"
+// magic, bnums only) also still work.
+struct MapFileHeaderV3Conn { char magic[4]; uint32_t bnumsCount; uint32_t submapCount; uint32_t mapCount; };
 
 inline bool saveMapFileWithConnections(const fs::path &path, const ConnectionsData &conn, std::string &err)
 {
     FILE *f = std::fopen(path.string().c_str(), "wb");
     if (!f) { err = "Could not open file for writing"; return false; }
-    MapFileHeaderV2 hdr{{'R', 'K', 'M', '2'}, (uint32_t)MAP_COUNT, (uint32_t)MAP_NBR_SUBMAPS};
+    MapFileHeaderV3Conn hdr{{'R', 'K', 'M', '3'}, (uint32_t)MAP_COUNT, (uint32_t)MAP_NBR_SUBMAPS, (uint32_t)MAP_NBR_MAPS};
     bool ok = std::fwrite(&hdr, sizeof(hdr), 1, f) == 1
            && std::fwrite(map_bnums, sizeof(int), MAP_COUNT, f) == (size_t)MAP_COUNT;
     for (int i = 0; ok && i < MAP_NBR_SUBMAPS; i++)
@@ -385,6 +429,14 @@ inline bool saveMapFileWithConnections(const fs::path &path, const ConnectionsDa
             ok = ok && std::fwrite(vals, 4, 4, f) == 4;
         }
     }
+    for (int i = 0; ok && i < MAP_NBR_MAPS; i++)
+    {
+        int sm = conn.mapStarts[i].submap;
+        int base = (sm >= 0 && sm < MAP_NBR_SUBMAPS) ? submapStartRow(conn.submaps[sm]) : 0;
+        int rawRow = conn.mapStarts[i].row - base;
+        int32_t vals[4] = {conn.mapStarts[i].x, conn.mapStarts[i].y, rawRow, conn.mapStarts[i].submap};
+        ok = ok && std::fwrite(vals, 4, 4, f) == 4;
+    }
     std::fclose(f);
     if (!ok) { err = "Write error"; return false; }
     return true;
@@ -398,7 +450,14 @@ inline bool loadMapFileWithConnections(const fs::path &path, ConnectionsData &co
     if (std::fread(magic, 1, 4, f) != 4) { std::fclose(f); err = "Not a valid .map file"; return false; }
     std::fseek(f, 0, SEEK_SET);
 
-    if (std::memcmp(magic, "RKM2", 4) != 0)
+    if (std::memcmp(magic, "RKMP", 4) != 0 && std::memcmp(magic, "RKM2", 4) != 0 && std::memcmp(magic, "RKM3", 4) != 0)
+    {
+        std::fclose(f);
+        err = "Unknown .map file format";
+        return false;
+    }
+
+    if (std::memcmp(magic, "RKMP", 4) == 0)
     {
         // Legacy v1 file (bnums only) -- load it as before, leave
         // whatever connections are currently loaded untouched.
@@ -406,11 +465,28 @@ inline bool loadMapFileWithConnections(const fs::path &path, ConnectionsData &co
         return loadMapFile(path, err);
     }
 
-    MapFileHeaderV2 hdr{};
-    bool ok = std::fread(&hdr, sizeof(hdr), 1, f) == 1
-            && hdr.bnumsCount == (uint32_t)MAP_COUNT && hdr.submapCount == (uint32_t)MAP_NBR_SUBMAPS;
-    if (!ok) { std::fclose(f); err = "Unsupported or mismatched .map file"; return false; }
-    ok = std::fread(map_bnums, sizeof(int), MAP_COUNT, f) == (size_t)MAP_COUNT;
+    bool isV3 = (std::memcmp(magic, "RKM3", 4) == 0);
+
+    MapFileHeaderV3Conn hdr{};
+    if (isV3)
+    {
+        bool ok = std::fread(&hdr, sizeof(hdr), 1, f) == 1
+                && hdr.bnumsCount == (uint32_t)MAP_COUNT && hdr.submapCount == (uint32_t)MAP_NBR_SUBMAPS;
+        if (!ok) { std::fclose(f); err = "Unsupported or mismatched .map file"; return false; }
+    }
+    else
+    {
+        // v2 header: read just the first 12 bytes (magic + 2 uint32s), zero the third
+        uint32_t bc, sc;
+        bool ok = std::fread(hdr.magic, 4, 1, f) == 1
+                && std::fread(&bc, 4, 1, f) == 1
+                && std::fread(&sc, 4, 1, f) == 1;
+        hdr.bnumsCount = bc; hdr.submapCount = sc; hdr.mapCount = 0;
+        if (!ok || hdr.bnumsCount != (uint32_t)MAP_COUNT || hdr.submapCount != (uint32_t)MAP_NBR_SUBMAPS)
+        { std::fclose(f); err = "Unsupported or mismatched .map file"; return false; }
+    }
+
+    bool ok = std::fread(map_bnums, sizeof(int), MAP_COUNT, f) == (size_t)MAP_COUNT;
     if (!ok) { std::fclose(f); err = "Read error (level layout)"; return false; }
 
     ConnectionsData loaded;
@@ -430,6 +506,20 @@ inline bool loadMapFileWithConnections(const fs::path &path, ConnectionsData &co
             if (ok) loaded.exits[i].push_back(ConnectEntry{(int)vals[0], (int)vals[1], (int)vals[2], (int)vals[3]});
         }
     }
+
+    // v3: also read per-map start positions
+    if (ok && isV3 && hdr.mapCount == (uint32_t)MAP_NBR_MAPS)
+    {
+        for (int i = 0; i < MAP_NBR_MAPS; i++)
+        {
+            int32_t vals[4];
+            if (std::fread(vals, 4, 4, f) != 4) { ok = false; break; }
+            int sm = (int)vals[3];
+            int base = (sm >= 0 && sm < MAP_NBR_SUBMAPS) ? submapStartRow(loaded.submaps[sm]) : 0;
+            loaded.mapStarts[i] = {(int)vals[0], (int)vals[1], (int)vals[2] + base, sm};
+        }
+    }
+
     std::fclose(f);
     if (!ok) { err = "Read error (screen connections)"; return false; }
     conn = loaded;
@@ -473,6 +563,41 @@ inline PatchResult patchXrickBinaryFull(const fs::path &xrickPath, ConnectionsDa
             res.message = "Could not patch map_connect: " + err;
             return res;
         }
+
+        // Patch map_maps (per-map start positions). Each entry is 12
+        // bytes: {U16 x, U16 y, U16 row, U16 submap, char *tune}.
+        // We read the existing tune pointers and preserve them.
+        {
+            size_t moff = 0, msize = 0;
+            std::string merr;
+            if (elf32_find_symbol_file_offset(buf, "map_maps", moff, msize, merr)
+                && msize >= (size_t)MAP_NBR_MAPS * 12)
+            {
+                // Read existing tune pointers (4 bytes at offset 8 of each 12-byte entry)
+                std::vector<uint8_t> patched(MAP_NBR_MAPS * 12);
+                for (int i = 0; i < MAP_NBR_MAPS; i++)
+                {
+                    uint16_t x = (uint16_t)conn->mapStarts[i].x;
+                    uint16_t y = (uint16_t)conn->mapStarts[i].y;
+                    int sm = conn->mapStarts[i].submap;
+                    int base = (sm >= 0 && sm < MAP_NBR_SUBMAPS) ? submapStartRow(conn->submaps[sm]) : 0;
+                    int rawRow = conn->mapStarts[i].row - base;
+                    rawRow = (rawRow / 4) * 4;
+                    if (rawRow < 0) rawRow = 0;
+                    if (rawRow > 255) rawRow = 255;
+                    uint16_t row = (uint16_t)rawRow;
+                    uint16_t submap = (uint16_t)conn->mapStarts[i].submap;
+                    std::memcpy(&patched[i * 12 + 0], &x, 2);
+                    std::memcpy(&patched[i * 12 + 2], &y, 2);
+                    std::memcpy(&patched[i * 12 + 4], &row, 2);
+                    std::memcpy(&patched[i * 12 + 6], &submap, 2);
+                    // Preserve existing tune pointer (bytes 8-11)
+                    std::memcpy(&patched[i * 12 + 8], &buf[moff + i * 12 + 8], 4);
+                }
+                std::memcpy(buf.data() + moff, patched.data(), MAP_NBR_MAPS * 12);
+            }
+        }
+
         patchedConnections = true;
     }
 

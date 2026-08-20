@@ -674,6 +674,37 @@ inline PatchResult patchXrickBinaryWithSprites(const fs::path &xrickPath, Connec
     { res.message = "Could not patch map_submaps: " + err; return res; }
     if (!elf32_patch_symbol(buf, "map_connect", conn.packedConnect.data(), conn.packedConnect.size(), err))
     { res.message = "Could not patch map_connect: " + err; return res; }
+    // Patch map_maps (per-map start positions). Each entry is 12
+    // bytes: {U16 x, U16 y, U16 row, U16 submap, char *tune}.
+    // We read the existing tune pointers and preserve them.
+    {
+        size_t moff = 0, msize = 0;
+        if (elf32_find_symbol_file_offset(buf, "map_maps", moff, msize, err)
+            && msize >= (size_t)MAP_NBR_MAPS * 12)
+        {
+            std::vector<uint8_t> patched(MAP_NBR_MAPS * 12);
+            for (int i = 0; i < MAP_NBR_MAPS; i++)
+            {
+                uint16_t x = (uint16_t)conn.mapStarts[i].x;
+                uint16_t y = (uint16_t)conn.mapStarts[i].y;
+                int sm = conn.mapStarts[i].submap;
+                int base = (sm >= 0 && sm < MAP_NBR_SUBMAPS) ? submapStartRow(conn.submaps[sm]) : 0;
+                int rawRow = conn.mapStarts[i].row - base;
+                rawRow = (rawRow / 4) * 4;
+                if (rawRow < 0) rawRow = 0;
+                if (rawRow > 255) rawRow = 255;
+                uint16_t row = (uint16_t)rawRow;
+                uint16_t submap = (uint16_t)conn.mapStarts[i].submap;
+                std::memcpy(&patched[i * 12 + 0], &x, 2);
+                std::memcpy(&patched[i * 12 + 2], &y, 2);
+                std::memcpy(&patched[i * 12 + 4], &row, 2);
+                std::memcpy(&patched[i * 12 + 6], &submap, 2);
+                // Preserve existing tune pointer (bytes 8-11)
+                std::memcpy(&patched[i * 12 + 8], &buf[moff + i * 12 + 8], 4);
+            }
+            std::memcpy(buf.data() + moff, patched.data(), MAP_NBR_MAPS * 12);
+        }
+    }
     if (!elf32_patch_symbol(buf, "map_marks", marks.packedMarks.data(), marks.packedMarks.size(), err))
     { res.message = "Could not patch map_marks: " + err; return res; }
     if (!elf32_patch_symbol(buf, "map_eflg_c", eflgPacked, MAP_NBR_EFLGC, err))
