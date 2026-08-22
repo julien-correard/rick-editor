@@ -445,7 +445,7 @@ inline bool saveMapFileWithSprites(const fs::path &path, const ConnectionsData &
 {
     FILE *f = std::fopen(path.string().c_str(), "wb");
     if (!f) { err = "Could not open file for writing"; return false; }
-    MapFileHeaderV3 hdr{{'R', 'K', 'M', 'A'}, (uint32_t)MAP_COUNT, (uint32_t)MAP_NBR_SUBMAPS};
+    MapFileHeaderV3 hdr{{'R', 'K', 'M', 'B'}, (uint32_t)MAP_COUNT, (uint32_t)MAP_NBR_SUBMAPS};
     bool ok = std::fwrite(&hdr, sizeof(hdr), 1, f) == 1
            && std::fwrite(map_bnums, sizeof(int), MAP_COUNT, f) == (size_t)MAP_COUNT;
     for (int i = 0; ok && i < MAP_NBR_SUBMAPS; i++)
@@ -490,6 +490,17 @@ inline bool saveMapFileWithSprites(const fs::path &path, const ConnectionsData &
         }
     }
     ok = ok && std::fwrite(tiles_data[0], sizeof(tile_t), 0x100, f) == 0x100;
+    if (ok)
+    {
+        for (int i = 0; i < MAP_NBR_MAPS; i++)
+        {
+            int sm = conn.mapStarts[i].submap;
+            int base = (sm >= 0 && sm < MAP_NBR_SUBMAPS) ? submapStartRow(conn.submaps[sm]) : 0;
+            int rawRow = conn.mapStarts[i].row - base;
+            int32_t vals[4] = {conn.mapStarts[i].x, conn.mapStarts[i].y, rawRow, conn.mapStarts[i].submap};
+            ok = ok && std::fwrite(vals, 4, 4, f) == 4;
+        }
+    }
     std::fclose(f);
     if (!ok) { err = "Write error"; return false; }
     return true;
@@ -506,7 +517,8 @@ inline bool loadMapFileWithSprites(const fs::path &path, ConnectionsData &conn, 
     probe.read(magic, 4);
     probe.close();
 
-    bool hasBank0Tiles = std::memcmp(magic, "RKMA", 4) == 0;
+    bool hasBank0Tiles = std::memcmp(magic, "RKMB", 4) == 0 || std::memcmp(magic, "RKMA", 4) == 0;
+    bool hasMapStarts = std::memcmp(magic, "RKMB", 4) == 0;
     bool hasTexts = hasBank0Tiles || std::memcmp(magic, "RKM9", 4) == 0;
     bool hasSprites = hasTexts || std::memcmp(magic, "RKM8", 4) == 0;
     bool hasBlocks = hasSprites || std::memcmp(magic, "RKM7", 4) == 0;
@@ -555,7 +567,13 @@ inline bool loadMapFileWithSprites(const fs::path &path, ConnectionsData &conn, 
         {
             int32_t vals[7];
             ok = std::fread(vals, 4, 7, f) == 7;
-            if (ok) loadedMarks.marks[i].push_back(MarkEntry{(int)vals[0], (int)vals[1], (int)vals[2], (int)vals[3], (int)vals[4], (int)vals[5], (int)vals[6]});
+            if (ok)
+            {
+                MarkEntry me{(int)vals[0], (int)vals[1], (int)vals[2], (int)vals[3], (int)vals[4], (int)vals[5], (int)vals[6]};
+                me.trigRowOffset = std::clamp(me.trigRowOffset, 0, 7);
+                me.fineY = std::clamp(me.fineY, 0, 7);
+                loadedMarks.marks[i].push_back(me);
+            }
         }
     }
     if (!ok) { std::fclose(f); err = "Read error (sprites)"; return false; }
@@ -625,6 +643,18 @@ inline bool loadMapFileWithSprites(const fs::path &path, ConnectionsData &conn, 
         // caller rebuilds the tile/block atlas textures afterwards.
         ok = std::fread(tiles_data[0], sizeof(tile_t), 0x100, f) == 0x100;
         if (!ok) { std::fclose(f); err = "Read error (bank 0 tile graphics)"; return false; }
+    }
+    if (hasMapStarts)
+    {
+        for (int i = 0; i < MAP_NBR_MAPS; i++)
+        {
+            int32_t vals[4];
+            if (std::fread(vals, 4, 4, f) != 4) { ok = false; break; }
+            int sm = (int)vals[3];
+            int base = (sm >= 0 && sm < MAP_NBR_SUBMAPS) ? submapStartRow(loadedConn.submaps[sm]) : 0;
+            loadedConn.mapStarts[i] = {(int)vals[0], (int)vals[1], (int)vals[2] + base, sm};
+        }
+        if (!ok) { std::fclose(f); err = "Read error (map start positions)"; return false; }
     }
     std::fclose(f);
 

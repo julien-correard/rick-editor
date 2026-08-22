@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <set>
 #include <string>
 #include <vector>
 #include <filesystem>
@@ -85,6 +86,15 @@ struct Selection
     }
 };
 
+struct Clipboard
+{
+    bool hasData = false;
+    int width = 0, height = 0;
+    std::vector<int> blocks; // width * height block indices
+
+    void clear() { hasData = false; width = height = 0; blocks.clear(); }
+};
+
 enum class CanvasMode { Submap, Block, Sprite };
 
 struct EditorState
@@ -98,6 +108,9 @@ struct EditorState
     bool panning = false;
     bool dirty = false;        // unsaved changes
     int lastPaintCol = -1, lastPaintRow = -1;
+    Clipboard clip;            // copied block region
+    bool pasting = false;      // paste mode: click to place clipboard
+    int pasteCol = -1, pasteRow = -1; // cursor position in paste mode
     fs::path currentPath;      // empty if the map was never saved/loaded
 
     // Canvas mode: what a left-click on the map does. Submap = nothing
@@ -109,11 +122,16 @@ struct EditorState
     // windows is scoped to its matching mode, so only one is ever up.
     CanvasMode canvasMode = CanvasMode::Block;
     bool showGrid = false;         // always-available block-grid overlay (also on above a zoom threshold, see drawMap())
+    bool showTriggerBoxes = true;  // show trigger-box overlay for trap entities
 
     // Sprites
     bool showSprites = true;       // overlay toggle -- can be turned off to focus on tile editing
+    bool showMapStartPositions = true; // show map start position markers above sprites
     int selectedEnt = 4;           // entity type id to place (lowest observed in stock data)
     int hoverMarkSubmap = -1, hoverMarkIndex = -1; // nearest sprite under cursor, for right-click removal
+
+    // Map start placement mode: -1 = off, 0..MAP_NBR_MAPS-1 = placing that map's start position
+    int placeStartMode = -1;
 };
 
 // State for the standalone Tile Editor window -- separate from the map
@@ -125,7 +143,144 @@ struct TileEditorState
     int bank = 1;          // FIRST_USABLE_BANK..LAST_USABLE_BANK, same convention as st.bank
     int selectedTile = -1; // -1 = nothing selected yet
     int batchStartTile = 0; // "Batch import..." starting tile index
+    bool swapMode = false; // "Swap with..." armed -- next tile clicked swaps with selectedTile
 };
+
+struct PixelEditorState
+{
+    bool open = false;
+    enum Target { Tile, Sprite } target = Tile;
+    int bank = 0;    // tile bank (only used when target == Tile)
+    int index = 0;   // tile or sprite index
+    int color = 1;   // current drawing color (0-15)
+    tile_t backupTile{};
+    sprite_t backupSprite{};
+};
+
+static inline int getTilePixel(const tile_t &tile, int x, int y)
+{
+    return (tile[y] >> (28 - x * 4)) & 0xF;
+}
+
+static inline void setTilePixel(tile_t &tile, int x, int y, int c)
+{
+    tile[y] = (tile[y] & ~(0xFu << (28 - x * 4))) | ((uint32_t)(c & 0xF) << (28 - x * 4));
+}
+
+static inline int getSpritePixel(const sprite_t &spr, int x, int y)
+{
+    int word = x / 8, bit = 28 - (x % 8) * 4;
+    return (spr[y][word] >> bit) & 0xF;
+}
+
+static inline void setSpritePixel(sprite_t &spr, int x, int y, int c)
+{
+    int word = x / 8, bit = 28 - (x % 8) * 4;
+    spr[y][word] = (spr[y][word] & ~(0xFu << bit)) | ((uint32_t)(c & 0xF) << bit);
+}
+
+// Returns trigger box size (in tiles) for entity types that use one,
+// or (0,0) for types with no distinct trigger zone.
+static void entTriggerSize(int ent, int &tw, int &th)
+{
+    switch (ent)
+    {
+    case 25: tw =  4; th = 4; return;  // arrow trap
+    case 26: tw = 16; th = 4; return;  // arrow trap, wide trigger
+    case 44: tw =  4; th = 4; return;  // stone block, slides left
+    case 48: tw =  4; th = 4; return;  // stone block, complex path
+    case 45: tw = 20; th = 4; return;  // wide grille
+    case 49: tw =  4; th = 4; return;  // narrow grille
+    case 52: tw =  4; th = 4; return;  // rising grille
+    case 72: tw =  4; th = 4; return;  // stone block, slides right
+    default: tw = 0;  th = 0; return;
+    }
+}
+
+// Returns a short gameplay description for well-known entity types, or ""
+// for types that don't need a blurb yet.
+static const char *entInfoText(int ent)
+{
+    switch (ent)
+    {
+    // --- Falling grille traps (type-3, sprite 102) ---
+    case 45:
+        return "Grille trap (wide trigger, 160x32 px).\n"
+               "Falls 32 px onto the player, holds, then retracts.\n"
+               "Retriggerable. Trigger box = rick walk-through zone.";
+    case 49:
+        return "Grille trap (narrow trigger, 32x32 px).\n"
+               "Falls 48 px onto the player, holds, slow retraction.\n"
+               "Retriggerable. Trigger box = rick walk-through zone.";
+    case 52:
+        return "Grille trap (narrow trigger, 32x32 px).\n"
+               "Rises 32 px first, then slams down 32 px.\n"
+               "Retriggerable. Trigger box = rick walk-through zone.";
+    // --- Walkers / climbers (type 1a/1b/2) ---
+    case 4: case 5: case 6:
+        return "Patrol walker (type 1a). Walks horizontally,\n"
+               "turns at walls and trigger-point column.\n"
+               "3 walker/climber slots shared globally.";
+    case 7: case 8: case 9:
+        return "Chaser (type 1b). Pursues Rick vertically+horizontally.\n"
+               "3 walker/climber slots shared globally.";
+    case 10: case 11: case 12:
+        return "Climber (type 2). Climbs walls toward Rick.\n"
+               "3 walker/climber slots shared globally.";
+    case 13: case 14: case 15:
+        return "Patrol walker (type 1a variant). Same as 4-6.\n"
+               "3 walker/climber slots shared globally.";
+    // --- Type-3 traps (id >= 0x18) ---
+    case 29:
+        return "Type-3 entity. Starts asleep, wakes on trigger.\n"
+               "Movement sequence defined in ent_mvstep.";
+    case 30:
+        return "Type-3 entity. Starts asleep, wakes on trigger.\n"
+               "Movement sequence defined in ent_mvstep.";
+    // --- Boxes / bonuses (type 0, ids 16-23) ---
+    case 16: case 17: case 18: case 19:
+    case 20: case 21: case 22: case 23:
+        return "Box / bonus item. Static, picked up on contact.";
+    // --- Arrow traps ---
+    case 25:
+        return "Arrow trap. Fires horizontally toward Rick.\n"
+               "Trigger box = 32x32 px. Retriggerable.";
+    case 26:
+        return "Arrow trap (wide trigger, 128x32 px).\n"
+               "Fires horizontally toward Rick. Retriggerable.";
+    // --- Stone blocks (type-3, triggered by dynamite/bomb) ---
+    case 44:
+        return "Stone block (32x16). Blocks Rick's path.\n"
+               "When triggered by dynamite or proximity,\n"
+               "slides left ~560 px then loops.\n"
+               "Use dynamite to clear the way.";
+    case 48:
+        return "Stone block (32x16). Blocks Rick's path.\n"
+               "When triggered, follows a complex path:\n"
+               "left → down → left → pause → right → up\n"
+               "→ pause → right → fade → up → right → loop.\n"
+               "Use dynamite to clear the way.";
+    case 72:
+        return "Stone block (32x16). Blocks Rick's path.\n"
+               "When triggered by dynamite or proximity,\n"
+               "slides right ~560 px then loops.\n"
+               "Use dynamite to clear the way.";
+    // --- Special ---
+    case 32:
+        return "Arrow trap. Fires horizontally.\n"
+               "3 entity slots shared for arrows.";
+    case 37:
+        return "Arrow trap (horizontal). Fires toward Rick.";
+    default:
+        if (ent >= 0x18)
+            return "Type-3 entity. Starts asleep, wakes on trigger.\n"
+                   "Movement sequence defined in ent_mvstep.";
+        if (ent >= 4 && ent <= 15)
+            return "Walker / climber (type 1a/1b/2).\n"
+                   "3 slots shared globally. Moves toward Rick.";
+        return "";
+    }
+}
 
 // State for the standalone Block Editor window -- composes blocks out
 // of tiles (map_blocks), separate from both the map canvas and the Tile
@@ -269,7 +424,7 @@ static bool findMarkNear(const MarksData &marks, int col, int rowAbs, int &outSu
     return best <= RADIUS;
 }
 
-static void drawMap(SDL_Renderer* renderer, SDL_Texture* blockAtlas, const EditorState &st, int viewportW, int viewportH)
+static void drawMap(SDL_Renderer* renderer, SDL_Texture* blockAtlas, const EditorState &st, const ConnectionsData &conn, int viewportW, int viewportH)
 {
     int firstCol = std::max(0, (int)std::floor(st.cam.x / BLOCK_PX));
     int firstRow = std::max(0, (int)std::floor(st.cam.y / BLOCK_PX));
@@ -329,6 +484,21 @@ static void drawMap(SDL_Renderer* renderer, SDL_Texture* blockAtlas, const Edito
         SDL_SetRenderDrawColor(renderer, 80, 160, 255, 70);
         SDL_RenderFillRectF(renderer, &r);
         SDL_SetRenderDrawColor(renderer, 80, 160, 255, 220);
+        SDL_RenderDrawRectF(renderer, &r);
+    }
+
+    // Paste preview: ghost outline of the clipboard at the cursor position.
+    if (st.pasting && st.clip.hasData)
+    {
+        SDL_FRect r;
+        r.x = (st.pasteCol * BLOCK_PX - st.cam.x) * st.cam.zoom;
+        r.y = (st.pasteRow * BLOCK_PX - st.cam.y) * st.cam.zoom;
+        r.w = st.clip.width * destSize;
+        r.h = st.clip.height * destSize;
+        SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(renderer, 255, 200, 80, 60);
+        SDL_RenderFillRectF(renderer, &r);
+        SDL_SetRenderDrawColor(renderer, 255, 200, 80, 200);
         SDL_RenderDrawRectF(renderer, &r);
     }
 }
@@ -604,6 +774,7 @@ int main(int argc, char *argv[])
 
     EditorState st;
     TileEditorState tileEditor;
+    PixelEditorState pixelEditor;
     BlockEditorState blockEditor;
     SpriteEditorState spriteEditor;
     TextEditorState textEditor;
@@ -663,6 +834,26 @@ int main(int argc, char *argv[])
                         continue;
                     }
 
+                    // Map start placement mode: click = hero position.
+                    if (st.placeStartMode >= 0 && event.button.button == SDL_BUTTON_LEFT)
+                    {
+                        int tileCol = std::clamp(screenToTileCol(st, (float)event.button.x), 0, 31);
+                        int tileRow = screenToTileRow(st, (float)event.button.y);
+                        int roundedTileRow = (tileRow / 4) * 4;
+                        int owner = submapForAbsRow(connections, roundedTileRow);
+                        if (owner >= 0)
+                        {
+                            MapStartInfo &ms = connections.mapStarts[st.placeStartMode];
+                            ms.x = tileCol * TILE_PX;
+                            ms.y = 139;
+                            ms.row = roundedTileRow - 16;
+                            ms.submap = owner;
+                            st.dirty = true;
+                        }
+                        st.placeStartMode = -1;
+                        continue;
+                    }
+
                     if (st.canvasMode == CanvasMode::Submap)
                         continue; // deliberately inert -- clicking the map does nothing
 
@@ -711,6 +902,20 @@ int main(int argc, char *argv[])
                     // CanvasMode::Block -- paint/select/eyedrop tiles.
                     if (event.button.button == SDL_BUTTON_LEFT)
                     {
+                        if (st.pasting)
+                        {
+                            for (int r = 0; r < st.clip.height; r++)
+                                for (int c = 0; c < st.clip.width; c++)
+                                {
+                                    int tc = col + c, tr = row + r;
+                                    if (cellValid(tc, tr))
+                                        map_bnums[mapIndex(tc, tr)] = st.clip.blocks[r * st.clip.width + c];
+                                }
+                            st.dirty = true;
+                            st.pasting = false;
+                        }
+                        else
+                        {
                         const Uint8* ks = SDL_GetKeyboardState(nullptr);
                         bool shift = ks[SDL_SCANCODE_LSHIFT] || ks[SDL_SCANCODE_RSHIFT];
                         if (shift)
@@ -728,13 +933,18 @@ int main(int argc, char *argv[])
                             if (cellValid(col, row)) { map_bnums[mapIndex(col, row)] = st.selectedBlock; st.dirty = true; }
                             st.lastPaintCol = col; st.lastPaintRow = row;
                         }
+                        }
                     }
                     else if (event.button.button == SDL_BUTTON_RIGHT)
                     {
+                        if (st.pasting) { st.pasting = false; }
+                        else
+                        {
                         // Right button = eyedropper: pick the block under
                         // the cursor into the palette selection.
                         st.picking = true;
                         if (cellValid(col, row)) st.selectedBlock = map_bnums[mapIndex(col, row)];
+                        }
                     }
                 }
                 else if (event.type == SDL_MOUSEBUTTONUP)
@@ -765,15 +975,36 @@ int main(int argc, char *argv[])
                     {
                         st.selectedBlock = map_bnums[mapIndex(col, row)];
                     }
+                    if (st.pasting)
+                    {
+                        st.pasteCol = col; st.pasteRow = row;
+                    }
                 }
             }
 
             if (!kbWantedByUI && event.type == SDL_KEYDOWN)
             {
-                switch (event.key.keysym.sym)
+                bool ctrl = (event.key.keysym.mod & KMOD_CTRL) != 0;
+                if (ctrl && event.key.keysym.sym == SDLK_c && st.sel.active && st.canvasMode == CanvasMode::Block)
+                {
+                    int minC, minR, maxC, maxR;
+                    st.sel.normalized(minC, minR, maxC, maxR);
+                    st.clip.width = maxC - minC + 1;
+                    st.clip.height = maxR - minR + 1;
+                    st.clip.blocks.resize(st.clip.width * st.clip.height);
+                    for (int r = 0; r < st.clip.height; r++)
+                        for (int c = 0; c < st.clip.width; c++)
+                            st.clip.blocks[r * st.clip.width + c] = map_bnums[mapIndex(minC + c, minR + r)];
+                    st.clip.hasData = true;
+                }
+                else if (ctrl && event.key.keysym.sym == SDLK_v && st.clip.hasData && st.canvasMode == CanvasMode::Block)
+                    st.pasting = !st.pasting;
+                else switch (event.key.keysym.sym)
                 {
                     case SDLK_ESCAPE:
                         st.sel.active = false;
+                        st.pasting = false;
+                        st.placeStartMode = -1;
                         break;
                     case SDLK_DELETE:
                     case SDLK_BACKSPACE:
@@ -875,6 +1106,35 @@ int main(int argc, char *argv[])
                 if (ImGui::MenuItem("Quit")) running = false;
                 ImGui::EndMenu();
             }
+            if (ImGui::BeginMenu("Edit"))
+            {
+                bool canCopy = st.sel.active && st.canvasMode == CanvasMode::Block;
+                bool canPaste = st.clip.hasData && st.canvasMode == CanvasMode::Block;
+                bool canFill = st.sel.active && st.canvasMode == CanvasMode::Block;
+                if (ImGui::MenuItem("Copy", "Ctrl+C", false, canCopy))
+                {
+                    int minC, minR, maxC, maxR;
+                    st.sel.normalized(minC, minR, maxC, maxR);
+                    st.clip.width = maxC - minC + 1;
+                    st.clip.height = maxR - minR + 1;
+                    st.clip.blocks.resize(st.clip.width * st.clip.height);
+                    for (int r = 0; r < st.clip.height; r++)
+                        for (int c = 0; c < st.clip.width; c++)
+                            st.clip.blocks[r * st.clip.width + c] = map_bnums[mapIndex(minC + c, minR + r)];
+                    st.clip.hasData = true;
+                }
+                if (ImGui::MenuItem("Paste", "Ctrl+V", false, canPaste))
+                    st.pasting = !st.pasting;
+                if (ImGui::MenuItem("Fill with selection", "F", false, canFill))
+                    clearSelection(st, st.selectedBlock);
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("View"))
+            {
+                ImGui::MenuItem("Trigger boxes", nullptr, &st.showTriggerBoxes);
+                ImGui::MenuItem("Map start positions", nullptr, &st.showMapStartPositions);
+                ImGui::EndMenu();
+            }
             if (!st.currentPath.empty())
                 ImGui::Text("  %s%s", st.currentPath.filename().string().c_str(), st.dirty ? " *" : "");
             ImGui::EndMainMenuBar();
@@ -963,10 +1223,19 @@ int main(int argc, char *argv[])
             if (ImGui::SmallButton("Reset zoom")) { st.cam.zoom = 2.0f; }
             wrap();
 
-            divider();
-            if (ImGui::SmallButton("Fill selection (F)")) clearSelection(st, st.selectedBlock);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Fill the current rectangle selection with the selected block");
-            wrap();
+            if (st.pasting)
+            {
+                divider();
+                ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1), "Paste mode: click to place, Esc to cancel");
+                wrap();
+            }
+
+            if (st.placeStartMode >= 0)
+            {
+                divider();
+                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1), "Placing Map %d start: click on map, Esc to cancel", st.placeStartMode);
+                wrap();
+            }
 
             divider();
             {
@@ -1369,13 +1638,45 @@ int main(int argc, char *argv[])
                     float v1 = v0 + 1.0f / ATLAS_TILES_PER_ROW;
 
                     bool selected = (t == tileEditor.selectedTile);
-                    if (selected) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.55f, 0.95f, 1.0f));
+                    bool stylePushed = false;
+                    if (selected) { ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.55f, 0.95f, 1.0f)); stylePushed = true; }
+                    else if (tileEditor.swapMode) { ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.45f, 0.10f, 1.0f)); stylePushed = true; }
                     if (ImGui::ImageButton("##tile", tileTexId, ImVec2(thumb, thumb), ImVec2(u0, v0), ImVec2(u1, v1)))
                     {
-                        tileEditor.selectedTile = t;
-                        tileEditor.batchStartTile = t; // still freely editable in the Batch import field below
+                        if (tileEditor.swapMode && tileEditor.selectedTile >= 0 && t != tileEditor.selectedTile)
+                        {
+                            int a = tileEditor.selectedTile, b = t;
+                            int bank = tileEditor.bank;
+                            // Swap tile graphics
+                            tile_t tmp;
+                            std::memcpy(tmp, tiles_data[bank][a], sizeof(tile_t));
+                            std::memcpy(tiles_data[bank][a], tiles_data[bank][b], sizeof(tile_t));
+                            std::memcpy(tiles_data[bank][b], tmp, sizeof(tile_t));
+                            // Swap hazard flags (banks 1+ only; bank 0 has no eflg)
+                            if (bank >= 1)
+                            {
+                                uint8_t tmpF = eflg.bank[bank - 1][a];
+                                eflg.bank[bank - 1][a] = eflg.bank[bank - 1][b];
+                                eflg.bank[bank - 1][b] = tmpF;
+                            }
+                            // Update all blocks that reference these tiles
+                            for (int bl = 0; bl < 0x100; bl++)
+                                for (int s = 0; s < 16; s++)
+                                {
+                                    if (map_blocks[bl][s] == a) map_blocks[bl][s] = b;
+                                    else if (map_blocks[bl][s] == b) map_blocks[bl][s] = a;
+                                }
+                            rebuildBankAtlases(renderer, tileAtlas, blockAtlas, bank);
+                            tileEditor.swapMode = false;
+                            tileEditor.selectedTile = b;
+                        }
+                        else
+                        {
+                            tileEditor.selectedTile = t;
+                            tileEditor.batchStartTile = t;
+                        }
                     }
-                    if (selected) ImGui::PopStyleColor();
+                    if (stylePushed) ImGui::PopStyleColor();
                     drawTileHazardBorder(ImGui::GetWindowDrawList(), ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), eflg.bank[tileEditor.bank - 1][t]);
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Tile %d", t);
                     float nextRight = ImGui::GetItemRectMax().x + teStyle.ItemSpacing.x + ImGui::GetItemRectSize().x;
@@ -1419,6 +1720,24 @@ int main(int argc, char *argv[])
                     }
                     ImGui::TextWrapped("Any image size works -- it's resampled to 8x8 and each pixel "
                                         "is matched to the closest of the 16 game colors.");
+
+                    ImGui::Spacing();
+                    if (ImGui::SmallButton(tileEditor.swapMode ? "Cancel swap" : "Swap with..."))
+                    {
+                        tileEditor.swapMode = !tileEditor.swapMode;
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Swap this tile's graphics, hazard flags and block references with another tile");
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Edit pixels"))
+                    {
+                        pixelEditor.open = true;
+                        pixelEditor.target = PixelEditorState::Tile;
+                        pixelEditor.bank = tileEditor.bank;
+                        pixelEditor.index = tileEditor.selectedTile;
+                        pixelEditor.color = 1;
+                        std::memcpy(pixelEditor.backupTile, tiles_data[tileEditor.bank][tileEditor.selectedTile], sizeof(tile_t));
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open pixel editor for this tile (8x8, 16 colors)");
 
                     ImGui::Separator();
                     ImGui::Text("Hazard flags (this tile, bank %d):", tileEditor.bank);
@@ -1466,6 +1785,132 @@ int main(int argc, char *argv[])
                 }
             }
             ImGui::EndChild();
+
+            ImGui::End();
+        }
+
+        // --- Pixel Editor -- standalone window for editing tile/sprite pixels
+        if (pixelEditor.open)
+        {
+            const char *title = pixelEditor.target == PixelEditorState::Tile
+                ? "Pixel Editor (tile)" : "Pixel Editor (sprite)";
+
+            int pixW = pixelEditor.target == PixelEditorState::Tile ? 8 : 32;
+            int pixH = pixelEditor.target == PixelEditorState::Tile ? 8 : 21;
+            float cellPx = 14.0f;
+            float paletteW = 120.0f;
+            float gridW = pixW * cellPx;
+            float gridH = pixH * cellPx;
+            float buttonsH = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y * 2;
+            float winW = gridW + paletteW + ImGui::GetStyle().WindowPadding.x * 2 + ImGui::GetStyle().ItemSpacing.x + ImGui::GetStyle().WindowPadding.x * 2;
+            float winH = gridH + buttonsH + ImGui::GetStyle().WindowPadding.y * 2;
+            ImGui::SetNextWindowSize(ImVec2(winW, winH), ImGuiCond_Always);
+            ImGui::Begin(title, &pixelEditor.open);
+            ImGui::BeginChild("##pixGrid", ImVec2(gridW, gridH), true);
+            {
+                ImDrawList *dl = ImGui::GetWindowDrawList();
+                ImVec2 origin = ImGui::GetCursorScreenPos();
+                for (int y = 0; y < pixH; y++)
+                {
+                    for (int x = 0; x < pixW; x++)
+                    {
+                        ImGui::PushID(y * pixW + x);
+                        ImVec2 p0(origin.x + x * cellPx, origin.y + y * cellPx);
+                        ImVec2 p1(p0.x + cellPx, p0.y + cellPx);
+                        int cidx;
+                        if (pixelEditor.target == PixelEditorState::Tile)
+                            cidx = getTilePixel(tiles_data[pixelEditor.bank][pixelEditor.index], x, y);
+                        else
+                            cidx = getSpritePixel(sprites_data[pixelEditor.index], x, y);
+                        ImVec4 col(RED[cidx] / 255.0f, GREEN[cidx] / 255.0f, BLUE[cidx] / 255.0f, 1.0f);
+                        dl->AddRectFilled(p0, p1, ImGui::ColorConvertFloat4ToU32(col));
+                        dl->AddRect(p0, p1, IM_COL32(60, 60, 60, 255));
+                        // Invisible button for click detection
+                        ImGui::SetCursorScreenPos(p0);
+                        ImGui::InvisibleButton("##px", ImVec2(cellPx, cellPx));
+                        if (ImGui::IsItemActive() && ImGui::IsMouseDragging(0))
+                        {
+                            if (pixelEditor.target == PixelEditorState::Tile)
+                                setTilePixel(tiles_data[pixelEditor.bank][pixelEditor.index], x, y, pixelEditor.color);
+                            else
+                                setSpritePixel(sprites_data[pixelEditor.index], x, y, pixelEditor.color);
+                            st.dirty = true;
+                            if (pixelEditor.target == PixelEditorState::Tile)
+                                rebuildBankAtlases(renderer, tileAtlas, blockAtlas, pixelEditor.bank);
+                            else
+                                rebuildSpriteAtlas(renderer, spriteAtlas);
+                        }
+                        else if (ImGui::IsItemClicked(0))
+                        {
+                            if (pixelEditor.target == PixelEditorState::Tile)
+                                setTilePixel(tiles_data[pixelEditor.bank][pixelEditor.index], x, y, pixelEditor.color);
+                            else
+                                setSpritePixel(sprites_data[pixelEditor.index], x, y, pixelEditor.color);
+                            st.dirty = true;
+                            if (pixelEditor.target == PixelEditorState::Tile)
+                                rebuildBankAtlases(renderer, tileAtlas, blockAtlas, pixelEditor.bank);
+                            else
+                                rebuildSpriteAtlas(renderer, spriteAtlas);
+                        }
+                        else if (ImGui::IsItemClicked(1))
+                        {
+                            if (pixelEditor.target == PixelEditorState::Tile)
+                                pixelEditor.color = getTilePixel(tiles_data[pixelEditor.bank][pixelEditor.index], x, y);
+                            else
+                                pixelEditor.color = getSpritePixel(sprites_data[pixelEditor.index], x, y);
+                        }
+                        ImGui::PopID();
+                    }
+                }
+            }
+            ImGui::EndChild();
+
+            ImGui::SameLine();
+            ImGui::BeginChild("##pixPalette", ImVec2(paletteW, gridH));
+            {
+                ImGui::Text("Color: %d", pixelEditor.color);
+                float swatch = 20.0f;
+                for (int i = 0; i < 16; i++)
+                {
+                    if (i % 4 != 0) ImGui::SameLine(0, 2);
+                    ImVec4 col(RED[i] / 255.0f, GREEN[i] / 255.0f, BLUE[i] / 255.0f, 1.0f);
+                    if (pixelEditor.color == i)
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(col.x * 1.3f, col.y * 1.3f, col.z * 1.3f, 1.0f));
+                    else
+                        ImGui::PushStyleColor(ImGuiCol_Button, col);
+                    char id[8]; snprintf(id, sizeof(id), "##c%d", i);
+                    if (ImGui::Button(id, ImVec2(swatch, swatch)))
+                        pixelEditor.color = i;
+                    ImGui::PopStyleColor();
+                }
+                ImGui::Spacing();
+                ImVec4 curCol(RED[pixelEditor.color] / 255.0f, GREEN[pixelEditor.color] / 255.0f, BLUE[pixelEditor.color] / 255.0f, 1.0f);
+                ImGui::ColorButton("##cur", curCol, 0, ImVec2(paletteW - 10, 30));
+                ImGui::Spacing();
+                ImGui::TextDisabled("Left: paint");
+                ImGui::TextDisabled("Right: pick color");
+            }
+            ImGui::EndChild();
+
+            ImGui::Separator();
+            if (ImGui::Button("Save", ImVec2(80, 0)))
+            {
+                pixelEditor.open = false;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(80, 0)))
+            {
+                if (pixelEditor.target == PixelEditorState::Tile)
+                    std::memcpy(tiles_data[pixelEditor.bank][pixelEditor.index], pixelEditor.backupTile, sizeof(tile_t));
+                else
+                    std::memcpy(sprites_data[pixelEditor.index], pixelEditor.backupSprite, sizeof(sprite_t));
+                if (pixelEditor.target == PixelEditorState::Tile)
+                    rebuildBankAtlases(renderer, tileAtlas, blockAtlas, pixelEditor.bank);
+                else
+                    rebuildSpriteAtlas(renderer, spriteAtlas);
+                st.dirty = true;
+                pixelEditor.open = false;
+            }
 
             ImGui::End();
         }
@@ -1537,7 +1982,13 @@ int main(int argc, char *argv[])
                         {
                             if (b != blockEditor.selectedBlock)
                             {
-                                std::swap(map_blocks[blockEditor.selectedBlock], map_blocks[b]);
+                                int a = blockEditor.selectedBlock;
+                                std::swap(map_blocks[a], map_blocks[b]);
+                                for (int i = 0; i < MAP_COUNT; i++)
+                                {
+                                    if (map_bnums[i] == a) map_bnums[i] = b;
+                                    else if (map_bnums[i] == b) map_bnums[i] = a;
+                                }
                                 rebuildBlockAtlasOnly(renderer, tileAtlas, blockAtlas, 1);
                                 rebuildBlockAtlasOnly(renderer, tileAtlas, blockAtlas, 2);
                                 st.dirty = true;
@@ -1608,7 +2059,7 @@ int main(int argc, char *argv[])
                         if (selected) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.55f, 0.95f, 1.0f));
                         if (ImGui::ImageButton("##cell", tileTexId, ImVec2(cell, cell), ImVec2(u0, v0), ImVec2(u1, v1)))
                             blockEditor.selectedCell = i;
-                        if (selected) ImGui::PopStyleColor();
+                    if (selected || tileEditor.swapMode) ImGui::PopStyleColor();
                         drawTileHazardBorder(ImGui::GetWindowDrawList(), ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), eflg.bank[blockEditor.bank - 1][t]);
                         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Cell %d (tile %d)", i, t);
                         if (i % 4 != 3) ImGui::SameLine();
@@ -1687,7 +2138,7 @@ int main(int argc, char *argv[])
                             }
                             if (isCurrent) ImGui::PopStyleColor();
                             drawTileHazardBorder(ImGui::GetWindowDrawList(), ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), eflg.bank[blockEditor.bank - 1][t]);
-                            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Tile %d", t);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip(tileEditor.swapMode ? "Swap with tile %d" : "Tile %d", t);
                             float nextRight = ImGui::GetItemRectMax().x + tpStyle.ItemSpacing.x + ImGui::GetItemRectSize().x;
                             if (t != 255 && nextRight < tpWindowRight)
                                 ImGui::SameLine();
@@ -1825,6 +2276,15 @@ int main(int argc, char *argv[])
                         fileDialog.filename[0] = '\0';
                         fileDialog.error.clear();
                     }
+                    if (ImGui::SmallButton("Edit pixels"))
+                    {
+                        pixelEditor.open = true;
+                        pixelEditor.target = PixelEditorState::Sprite;
+                        pixelEditor.index = spriteEditor.selectedSprite;
+                        pixelEditor.color = 1;
+                        std::memcpy(pixelEditor.backupSprite, sprites_data[spriteEditor.selectedSprite], sizeof(sprite_t));
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open pixel editor for this sprite (32x21, 16 colors)");
                     ImGui::TextWrapped("Any image size works -- it's resampled to %dx%d. Alpha below %d "
                                         "becomes transparent; opaque pixels are matched to the closest of "
                                         "the 15 non-transparent palette colors.", SPRITE_W, SPRITE_H, SPRITE_ALPHA_THRESHOLD);
@@ -2026,6 +2486,15 @@ int main(int argc, char *argv[])
                     ImGui::SetNextItemWidth(120);
                     ImGui::DragInt("Submap", &ms.submap, 1.0f, 0, MAP_NBR_SUBMAPS - 1);
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Starting submap index (0-%d)", MAP_NBR_SUBMAPS - 1);
+                    ImGui::SameLine();
+                    bool placing = (st.placeStartMode == m);
+                    if (placing) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.55f, 0.95f, 1.0f));
+                    if (ImGui::SmallButton("Place on map"))
+                        st.placeStartMode = placing ? -1 : m;
+                    if (placing) ImGui::PopStyleColor();
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip(placing ? "Click on the map to place %s start (Esc to cancel)"
+                                                  : "Click, then click on the map to place %s start position", mapNames[m]);
 
                     ImGui::PopID();
                     if (m < MAP_NBR_MAPS - 1) ImGui::Separator();
@@ -2220,45 +2689,52 @@ int main(int argc, char *argv[])
         ImGui::SetNextItemWidth(100);
         ImGui::DragInt("Entity type", &st.selectedEnt, 1.0f, 0, 255);
         {
-            // Quick-pick chips for entity ids already used elsewhere on the map.
-            std::vector<int> seen;
+            // Quick-pick chips for all entity types that have a valid sprite.
+            std::vector<int> all;
+            for (int e = 0; e < (int)entDataTable.size(); e++)
+                if (entDataTable[e].spr > 0 && entDataTable[e].spr < SPRITES_NBR_SPRITES)
+                    all.push_back(e);
+            // Mark which ones are already used on the map.
+            std::set<int> used;
             for (int s = 0; s < MAP_NBR_SUBMAPS; s++)
                 for (auto &m : sprites.marks[s])
-                    if (std::find(seen.begin(), seen.end(), m.ent) == seen.end()) seen.push_back(m.ent);
-            std::sort(seen.begin(), seen.end());
-            ImGui::TextDisabled("Used on this map:");
+                    used.insert(m.ent);
+            ImGui::TextDisabled("Entity types:");
             ImTextureID spriteTexIdQP = (ImTextureID)(intptr_t)spriteAtlas;
             ImGuiStyle &qpStyle = ImGui::GetStyle();
             float qpWindowRight = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
-            for (size_t qi = 0; qi < seen.size(); qi++)
+            for (size_t qi = 0; qi < all.size(); qi++)
             {
-                int e = seen[qi];
+                int e = all[qi];
                 ImGui::PushID(e);
-                int spr = (e >= 0 && e < (int)entDataTable.size()) ? entDataTable[e].spr : 0;
+                int spr = entDataTable[e].spr;
                 bool selected = (e == st.selectedEnt);
+                bool isUsed = used.count(e) > 0;
                 if (selected) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.55f, 0.95f, 1.0f));
-                if (spr > 0 && spr < SPRITES_NBR_SPRITES)
-                {
-                    float u0, v0, u1, v1;
-                    sprite_uv(spr, u0, v0, u1, v1);
-                    if (ImGui::ImageButton("##qp", spriteTexIdQP, ImVec2(24, 21), ImVec2(u0, v0), ImVec2(u1, v1)))
-                        st.selectedEnt = e;
-                }
-                else
-                {
-                    char label[16]; std::snprintf(label, sizeof label, "%d", e);
-                    if (ImGui::SmallButton(label)) st.selectedEnt = e;
-                }
-                if (selected) ImGui::PopStyleColor();
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Entity %d", e);
-                // Wrap onto a new line once the next chip would overflow the
-                // window's content region, instead of forcing everything
-                // onto one never-ending row that clips the last entries.
+                else if (isUsed) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.25f, 0.25f, 1.0f));
+                float u0, v0, u1, v1;
+                sprite_uv(spr, u0, v0, u1, v1);
+                if (ImGui::ImageButton("##qp", spriteTexIdQP, ImVec2(24, 21), ImVec2(u0, v0), ImVec2(u1, v1)))
+                    st.selectedEnt = e;
+                if (selected || isUsed) ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Entity %d%s", e, isUsed ? " (on map)" : "");
                 float lastItemRight = ImGui::GetItemRectMax().x;
                 float nextItemRight = lastItemRight + qpStyle.ItemSpacing.x + ImGui::GetItemRectSize().x;
-                if (qi + 1 < seen.size() && nextItemRight < qpWindowRight)
+                if (qi + 1 < all.size() && nextItemRight < qpWindowRight)
                     ImGui::SameLine();
                 ImGui::PopID();
+            }
+            // Entity info blurb for the currently selected type.
+            const char *info = entInfoText(st.selectedEnt);
+            if (info && info[0])
+            {
+                ImGui::Spacing();
+                ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.15f, 0.18f, 0.24f, 1.0f));
+                ImGui::BeginChild("##entInfo", ImVec2(-1, ImGui::GetTextLineHeightWithSpacing() * 4 + ImGui::GetStyle().WindowPadding.y * 2), true);
+                ImGui::TextDisabled("Type %d:", st.selectedEnt);
+                ImGui::TextWrapped("%s", info);
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
             }
         }
         ImGui::Separator();
@@ -2434,7 +2910,7 @@ int main(int argc, char *argv[])
                                 ImGui::SameLine();
                         };
                         flagBox("Rick", ENT_FLG_TRIGRICK, "TRIGRICK -- wakes up when Rick walks into the trigger box");
-                        flagBox("Stop", ENT_FLG_TRIGSTOP, "TRIGSTOP -- wakes up when Rick does his \"stop\" move there");
+                        flagBox("Cane", ENT_FLG_TRIGSTOP, "CANE -- wakes up when Rick does his cane move (FIRE+direction) inside the trigger box");
                         flagBox("Bullet", ENT_FLG_TRIGBULLET, "TRIGBULLET -- wakes up when a bullet hits the trigger box");
                         flagBox("Bomb", ENT_FLG_TRIGBOMB, "TRIGBOMB -- wakes up when a bomb hits the trigger box");
                         flagBox("Once", ENT_FLG_ONCE, "ONCE -- plays once and stays gone, instead of looping/respawning");
@@ -2567,14 +3043,67 @@ int main(int argc, char *argv[])
                         dl->AddLine(ImVec2(tsx - cr, tsy - cr), ImVec2(tsx + cr, tsy + cr), trigCol, 2.0f);
                         dl->AddLine(ImVec2(tsx - cr, tsy + cr), ImVec2(tsx + cr, tsy - cr), trigCol, 2.0f);
                     }
+                    // Full trigger box for grille traps and arrow traps.
+                    // Shows the actual rectangular zone the engine tests
+                    // against in u_trigbox(), so the user can see whether
+                    // Rick's walking path overlaps with it.
+                    // Uses the 3-bit-truncated trigRowOffset (the engine
+                    // reads lt & 0x07, not the full stored value) so the
+                    // box matches what xrick actually does at runtime.
+                    if (st.showTriggerBoxes)
+                    {
+                        int tw, th;
+                        entTriggerSize(m.ent, tw, th);
+                        if (tw > 0 && th > 0)
+                        {
+                            int engineTrigRow = m.rowAbs + (m.trigRowOffset & 7);
+                            float bx0 = m.trigCol * (float)TILE_PX;
+                            float by0 = engineTrigRow * (float)TILE_PX;
+                            float bx1 = bx0 + tw * TILE_PX;
+                            float by1 = by0 + th * TILE_PX;
+                            float sx0 = (bx0 - st.cam.x) * st.cam.zoom;
+                            float sy0 = (by0 - st.cam.y) * st.cam.zoom;
+                            float sx1 = (bx1 - st.cam.x) * st.cam.zoom;
+                            float sy1 = (by1 - st.cam.y) * st.cam.zoom;
+                            dl->AddRect(ImVec2(sx0, sy0), ImVec2(sx1, sy1),
+                                        IM_COL32(255, 60, 60, 100), 0.0f, 0, 2.0f);
+                            dl->AddRectFilled(ImVec2(sx0, sy0), ImVec2(sx1, sy1),
+                                              IM_COL32(255, 60, 60, 25));
+                        }
+                    }
                 }
+            }
+        }
+
+        // Map start position markers above sprites (foreground draw list).
+        if (st.showMapStartPositions)
+        {
+            ImDrawList *dl = ImGui::GetForegroundDrawList();
+            ImTextureID tileTexId = (ImTextureID)(intptr_t)tileAtlas[0];
+            for (int m = 0; m < MAP_NBR_MAPS; m++)
+            {
+                const MapStartInfo &ms = connections.mapStarts[m];
+                float lx = (ms.x - st.cam.x) * st.cam.zoom;
+                float ly = ((ms.row + 17) * TILE_PX - st.cam.y) * st.cam.zoom;
+                if (lx < -200 || lx > viewportW + 200 || ly < -50 || ly > viewportH + 50)
+                    continue;
+                int markerTileIdx = 0x31 + m;
+                int tx = (markerTileIdx % ATLAS_TILES_PER_ROW) * TILE_PX;
+                int ty = (markerTileIdx / ATLAS_TILES_PER_ROW) * TILE_PX;
+                float u0 = (float)tx / (float)TILE_ATLAS_PX;
+                float v0 = (float)ty / (float)TILE_ATLAS_PX;
+                float u1 = (float)(tx + TILE_PX) / (float)TILE_ATLAS_PX;
+                float v1 = (float)(ty + TILE_PX) / (float)TILE_ATLAS_PX;
+                float sz = TILE_PX * st.cam.zoom;
+                dl->AddImage(tileTexId, ImVec2(lx, ly), ImVec2(lx + sz, ly + sz),
+                             ImVec2(u0, v0), ImVec2(u1, v1));
             }
         }
 
         // --- Render ---
         SDL_SetRenderDrawColor(renderer, 20, 20, 24, 255);
         SDL_RenderClear(renderer);
-        drawMap(renderer, blockAtlas[st.bank], st, viewportW, viewportH);
+        drawMap(renderer, blockAtlas[st.bank], st, connections, viewportW, viewportH);
 
         ImGui::Render();
         ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), renderer);
