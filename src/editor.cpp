@@ -89,10 +89,18 @@ struct Selection
 struct Clipboard
 {
     bool hasData = false;
-    int width = 0, height = 0;
+    int width = 0, height = 0;  // in blocks
     std::vector<int> blocks; // width * height block indices
 
-    void clear() { hasData = false; width = height = 0; blocks.clear(); }
+    // Sprites captured within the copied block region.
+    struct CopiedSprite {
+        MarkEntry mark;        // full mark data
+        int relTileCol;        // tile column offset from selection left edge (0-based)
+        int relRowAbs;         // coarse row offset from selection top edge (0-based)
+    };
+    std::vector<CopiedSprite> sprites;
+
+    void clear() { hasData = false; width = height = 0; blocks.clear(); sprites.clear(); }
 };
 
 enum class CanvasMode { Submap, Block, Sprite };
@@ -144,6 +152,9 @@ struct TileEditorState
     int selectedTile = -1; // -1 = nothing selected yet
     int batchStartTile = 0; // "Batch import..." starting tile index
     bool swapMode = false; // "Swap with..." armed -- next tile clicked swaps with selectedTile
+                    bool copyMode = false; // "Copy to..." armed -- next tile clicked gets the copied tile
+    tile_t copiedTile{};
+    bool hasCopiedTile = false;
 };
 
 struct PixelEditorState
@@ -187,6 +198,9 @@ static void entTriggerSize(int ent, int &tw, int &th)
     {
     case 25: tw =  4; th = 4; return;  // arrow trap
     case 26: tw = 16; th = 4; return;  // arrow trap, wide trigger
+    case 27: tw =  4; th = 4; return;  // wall spike trap
+    case 32: tw =  4; th = 7; return;  // arrow trap, vertical
+    case 39: tw =  4; th = 4; return;  // spike trap
     case 44: tw =  4; th = 4; return;  // stone block, slides left
     case 48: tw =  4; th = 4; return;  // stone block, complex path
     case 45: tw = 20; th = 4; return;  // wide grille
@@ -217,18 +231,15 @@ static const char *entInfoText(int ent)
                "Rises 32 px first, then slams down 32 px.\n"
                "Retriggerable. Trigger box = rick walk-through zone.";
     // --- Walkers / climbers (type 1a/1b/2) ---
-    case 4: case 5: case 6:
-        return "Patrol walker (type 1a). Walks horizontally,\n"
-               "turns at walls and trigger-point column.\n"
+    case 4: case 7: case 10: case 13:
+        return "Patrol walker (type 1a). Walks right from spawn,\n"
+               "u-turns after 'patrol distance' tiles or on walls.\n"
                "3 walker/climber slots shared globally.";
-    case 7: case 8: case 9:
+    case 5: case 8: case 11: case 14:
         return "Chaser (type 1b). Pursues Rick vertically+horizontally.\n"
                "3 walker/climber slots shared globally.";
-    case 10: case 11: case 12:
+    case 6: case 9: case 12: case 15:
         return "Climber (type 2). Climbs walls toward Rick.\n"
-               "3 walker/climber slots shared globally.";
-    case 13: case 14: case 15:
-        return "Patrol walker (type 1a variant). Same as 4-6.\n"
                "3 walker/climber slots shared globally.";
     // --- Type-3 traps (id >= 0x18) ---
     case 29:
@@ -243,11 +254,14 @@ static const char *entInfoText(int ent)
         return "Box / bonus item. Static, picked up on contact.";
     // --- Arrow traps ---
     case 25:
-        return "Arrow trap. Fires horizontally toward Rick.\n"
+        return "Arrow trap. Fires right toward Rick.\n"
                "Trigger box = 32x32 px. Retriggerable.";
     case 26:
         return "Arrow trap (wide trigger, 128x32 px).\n"
-               "Fires horizontally toward Rick. Retriggerable.";
+               "Fires left toward Rick. Retriggerable.";
+    case 27:
+        return "Wall spike trap. Spikes emerge from walls.\n"
+               "Trigger box = 32x32 px. Retriggerable.";
     // --- Stone blocks (type-3, triggered by dynamite/bomb) ---
     case 44:
         return "Stone block (32x16). Blocks Rick's path.\n"
@@ -267,10 +281,13 @@ static const char *entInfoText(int ent)
                "Use dynamite to clear the way.";
     // --- Special ---
     case 32:
-        return "Arrow trap. Fires horizontally.\n"
+        return "Arrow trap. Fires vertically.\n"
                "3 entity slots shared for arrows.";
     case 37:
         return "Arrow trap (horizontal). Fires toward Rick.";
+    case 39:
+        return "Spike trap. Spikes rise from the ground.\n"
+               "Trigger box = 32x32 px. Retriggerable.";
     default:
         if (ent >= 0x18)
             return "Type-3 entity. Starts asleep, wakes on trigger.\n"
@@ -883,6 +900,10 @@ int main(int argc, char *argv[])
                                 // since that's the overwhelmingly common case. Other entity
                                 // types (walkers, etc.) don't consult these flags, so 0 is fine.
                                 int defaultFlags = (st.selectedEnt >= 0x18) ? ENT_FLG_TRIGRICK : 0;
+                                if (st.selectedEnt == 39)
+                                    defaultFlags |= ENT_FLG_LETHALI;
+                                if (st.selectedEnt == 25 || st.selectedEnt == 26 || st.selectedEnt == 32)
+                                    defaultFlags |= ENT_FLG_LETHALI;
                                 sprites.marks[owner].push_back(MarkEntry{snappedRow, tileCol, fineY, st.selectedEnt, defaultFlags, tileCol, 0});
                                 st.dirty = true;
                             }
@@ -911,6 +932,41 @@ int main(int argc, char *argv[])
                                     if (cellValid(tc, tr))
                                         map_bnums[mapIndex(tc, tr)] = st.clip.blocks[r * st.clip.width + c];
                                 }
+
+                            // Remove sprites in the paste target area.
+                            int tileTargetMinC = col * 4, tileTargetMinR = row * 4;
+                            int tileTargetMaxC = tileTargetMinC + st.clip.width * 4 - 1;
+                            int tileTargetMaxR = tileTargetMinR + st.clip.height * 4 - 1;
+                            for (int s = 0; s < MAP_NBR_SUBMAPS; s++)
+                            {
+                                auto &v = sprites.marks[s];
+                                for (int i = (int)v.size() - 1; i >= 0; i--)
+                                {
+                                    int effRow = markEffectiveRow(v[i]);
+                                    if (v[i].col >= tileTargetMinC && v[i].col <= tileTargetMaxC &&
+                                        effRow >= tileTargetMinR && effRow <= tileTargetMaxR)
+                                        v.erase(v.begin() + i);
+                                }
+                            }
+
+                            // Paste sprites at the target position.
+                            for (auto &cs : st.clip.sprites)
+                            {
+                                int newCol = col * 4 + cs.relTileCol;
+                                int newRowAbs = row * 4 + cs.relRowAbs;
+                                int newSubmap = submapForAbsRow(connections, newRowAbs);
+                                if (newSubmap < 0 || newCol < 0 || newCol > 31) continue;
+
+                                MarkEntry nm = cs.mark;
+                                nm.col = newCol;
+                                int base = submapStartRow(connections.submaps[newSubmap]);
+                                int newFineY, newTrigRowOff;
+                                nm.rowAbs = snapMarkRowToBase(newRowAbs, base, nm.fineY, nm.trigRowOffset, newFineY, newTrigRowOff);
+                                nm.fineY = newFineY;
+                                nm.trigRowOffset = newTrigRowOff;
+                                sprites.marks[newSubmap].push_back(nm);
+                            }
+
                             st.dirty = true;
                             st.pasting = false;
                         }
@@ -932,9 +988,9 @@ int main(int argc, char *argv[])
                             st.lastPaintCol = st.lastPaintRow = -1;
                             if (cellValid(col, row)) { map_bnums[mapIndex(col, row)] = st.selectedBlock; st.dirty = true; }
                             st.lastPaintCol = col; st.lastPaintRow = row;
-                        }
-                        }
-                    }
+                }
+            }
+        }
                     else if (event.button.button == SDL_BUTTON_RIGHT)
                     {
                         if (st.pasting) { st.pasting = false; }
@@ -995,6 +1051,21 @@ int main(int argc, char *argv[])
                     for (int r = 0; r < st.clip.height; r++)
                         for (int c = 0; c < st.clip.width; c++)
                             st.clip.blocks[r * st.clip.width + c] = map_bnums[mapIndex(minC + c, minR + r)];
+
+                    // Capture sprites within the block selection (tile coords).
+                    // Use rowAbs (coarse) for the relative offset so that
+                    // snapMarkRowToBase doesn't double-count fineY.
+                    int tileMinC = minC * 4, tileMaxC = maxC * 4 + 3;
+                    int tileMinR = minR * 4, tileMaxR = maxR * 4 + 3;
+                    st.clip.sprites.clear();
+                    for (int s = 0; s < MAP_NBR_SUBMAPS; s++)
+                        for (auto &m : sprites.marks[s])
+                        {
+                            int effRow = markEffectiveRow(m);
+                            if (m.col >= tileMinC && m.col <= tileMaxC && effRow >= tileMinR && effRow <= tileMaxR)
+                                st.clip.sprites.push_back({m, m.col - tileMinC, m.rowAbs - tileMinR});
+                        }
+
                     st.clip.hasData = true;
                 }
                 else if (ctrl && event.key.keysym.sym == SDLK_v && st.clip.hasData && st.canvasMode == CanvasMode::Block)
@@ -1005,6 +1076,8 @@ int main(int argc, char *argv[])
                         st.sel.active = false;
                         st.pasting = false;
                         st.placeStartMode = -1;
+                        tileEditor.swapMode = false;
+                        tileEditor.copyMode = false;
                         break;
                     case SDLK_DELETE:
                     case SDLK_BACKSPACE:
@@ -1121,6 +1194,18 @@ int main(int argc, char *argv[])
                     for (int r = 0; r < st.clip.height; r++)
                         for (int c = 0; c < st.clip.width; c++)
                             st.clip.blocks[r * st.clip.width + c] = map_bnums[mapIndex(minC + c, minR + r)];
+
+                    int tileMinC = minC * 4, tileMaxC = maxC * 4 + 3;
+                    int tileMinR = minR * 4, tileMaxR = maxR * 4 + 3;
+                    st.clip.sprites.clear();
+                    for (int s = 0; s < MAP_NBR_SUBMAPS; s++)
+                        for (auto &m : sprites.marks[s])
+                        {
+                            int effRow = markEffectiveRow(m);
+                            if (m.col >= tileMinC && m.col <= tileMaxC && effRow >= tileMinR && effRow <= tileMaxR)
+                                st.clip.sprites.push_back({m, m.col - tileMinC, m.rowAbs - tileMinR});
+                        }
+
                     st.clip.hasData = true;
                 }
                 if (ImGui::MenuItem("Paste", "Ctrl+V", false, canPaste))
@@ -1641,6 +1726,7 @@ int main(int argc, char *argv[])
                     bool stylePushed = false;
                     if (selected) { ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.55f, 0.95f, 1.0f)); stylePushed = true; }
                     else if (tileEditor.swapMode) { ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.45f, 0.10f, 1.0f)); stylePushed = true; }
+                    else if (tileEditor.copyMode) { ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.45f, 0.65f, 0.30f, 1.0f)); stylePushed = true; }
                     if (ImGui::ImageButton("##tile", tileTexId, ImVec2(thumb, thumb), ImVec2(u0, v0), ImVec2(u1, v1)))
                     {
                         if (tileEditor.swapMode && tileEditor.selectedTile >= 0 && t != tileEditor.selectedTile)
@@ -1669,6 +1755,14 @@ int main(int argc, char *argv[])
                             rebuildBankAtlases(renderer, tileAtlas, blockAtlas, bank);
                             tileEditor.swapMode = false;
                             tileEditor.selectedTile = b;
+                        }
+                        else if (tileEditor.copyMode && tileEditor.hasCopiedTile)
+                        {
+                            int bank = tileEditor.bank;
+                            std::memcpy(tiles_data[bank][t], tileEditor.copiedTile, sizeof(tile_t));
+                            rebuildBankAtlases(renderer, tileAtlas, blockAtlas, bank);
+                            tileEditor.copyMode = false;
+                            tileEditor.selectedTile = t;
                         }
                         else
                         {
@@ -1725,8 +1819,29 @@ int main(int argc, char *argv[])
                     if (ImGui::SmallButton(tileEditor.swapMode ? "Cancel swap" : "Swap with..."))
                     {
                         tileEditor.swapMode = !tileEditor.swapMode;
+                        tileEditor.copyMode = false;
                     }
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Swap this tile's graphics, hazard flags and block references with another tile");
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton(tileEditor.copyMode ? "Cancel copy" : "Copy to..."))
+                    {
+                        if (!tileEditor.copyMode)
+                        {
+                            std::memcpy(tileEditor.copiedTile, tiles_data[tileEditor.bank][tileEditor.selectedTile], sizeof(tile_t));
+                            tileEditor.hasCopiedTile = true;
+                        }
+                        tileEditor.copyMode = !tileEditor.copyMode;
+                        tileEditor.swapMode = false;
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copy this tile's graphics and hazard flags,\nthen click another tile to paste");
+                    if (ImGui::SmallButton("Delete"))
+                    {
+                        for (int y = 0; y < 8; y++)
+                            tiles_data[tileEditor.bank][tileEditor.selectedTile][y] = 0;
+                        rebuildBankAtlases(renderer, tileAtlas, blockAtlas, tileEditor.bank);
+                        st.dirty = true;
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Set all pixels of this tile to black (color 0)");
                     ImGui::SameLine();
                     if (ImGui::SmallButton("Edit pixels"))
                     {
@@ -1801,12 +1916,16 @@ int main(int argc, char *argv[])
             float paletteW = 120.0f;
             float gridW = pixW * cellPx;
             float gridH = pixH * cellPx;
+            float childExtra = ImGui::GetStyle().WindowPadding.x + ImGui::GetStyle().FramePadding.x * 2;
+            float childW = gridW + childExtra;
+            float childH = gridH + childExtra;
             float buttonsH = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y * 2;
-            float winW = gridW + paletteW + ImGui::GetStyle().WindowPadding.x * 2 + ImGui::GetStyle().ItemSpacing.x + ImGui::GetStyle().WindowPadding.x * 2;
-            float winH = gridH + buttonsH + ImGui::GetStyle().WindowPadding.y * 2;
+            float titleH = ImGui::GetFrameHeight();
+            float winW = childW + paletteW + ImGui::GetStyle().WindowPadding.x * 2 + ImGui::GetStyle().ItemSpacing.x;
+            float winH = childH + buttonsH + titleH + ImGui::GetStyle().WindowPadding.y * 2 + ImGui::GetStyle().ItemSpacing.y;
             ImGui::SetNextWindowSize(ImVec2(winW, winH), ImGuiCond_Always);
             ImGui::Begin(title, &pixelEditor.open);
-            ImGui::BeginChild("##pixGrid", ImVec2(gridW, gridH), true);
+            ImGui::BeginChild("##pixGrid", ImVec2(childW, childH), true);
             {
                 ImDrawList *dl = ImGui::GetWindowDrawList();
                 ImVec2 origin = ImGui::GetCursorScreenPos();
@@ -2486,7 +2605,6 @@ int main(int argc, char *argv[])
                     ImGui::SetNextItemWidth(120);
                     ImGui::DragInt("Submap", &ms.submap, 1.0f, 0, MAP_NBR_SUBMAPS - 1);
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Starting submap index (0-%d)", MAP_NBR_SUBMAPS - 1);
-                    ImGui::SameLine();
                     bool placing = (st.placeStartMode == m);
                     if (placing) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.55f, 0.95f, 1.0f));
                     if (ImGui::SmallButton("Place on map"))
@@ -2494,7 +2612,7 @@ int main(int argc, char *argv[])
                     if (placing) ImGui::PopStyleColor();
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip(placing ? "Click on the map to place %s start (Esc to cancel)"
-                                                  : "Click, then click on the map to place %s start position", mapNames[m]);
+                                                   : "Click, then click on the map to place %s start position", mapNames[m]);
 
                     ImGui::PopID();
                     if (m < MAP_NBR_MAPS - 1) ImGui::Separator();
@@ -2882,9 +3000,8 @@ int main(int argc, char *argv[])
                         ImGui::SetNextItemWidth(40);
                         ImGui::DragInt("##trigcol", &m.trigCol, 1.0f, 0, 31);
                         if (ImGui::IsItemHovered())
-                            ImGui::SetTooltip("This entity type (1a, patrol walker) reuses the trigger "
-                                               "point's column as its walking distance before a U-turn, "
-                                               "instead of a spatial trigger -- higher = walks further.");
+                            ImGui::SetTooltip("Walks right from spawn for this many tiles,\n"
+                                               "then u-turns. Green zone shows the range.");
                     }
                     // type 1b/2 (chaser/climber) and box/bonus types (16-23)
                     // don't consult the trigger point at all -- nothing shown.
@@ -3071,6 +3188,27 @@ int main(int argc, char *argv[])
                                               IM_COL32(255, 60, 60, 25));
                         }
                     }
+                    // Patrol zone for type-1a walkers: horizontal range
+                    // from spawn to spawn + trigCol tiles.
+                    if (st.showTriggerBoxes)
+                    {
+                        bool isType1a = (m.ent == 4 || m.ent == 7 || m.ent == 10 || m.ent == 13);
+                        if (isType1a && m.trigCol > 0)
+                        {
+                            float px0 = wx + TILE_PX;
+                            float py0 = wy;
+                            float px1 = wx + (m.trigCol + 2) * (float)TILE_PX;
+                            float py1 = wy + SPRITE_H;
+                            float dzx0 = (px0 - st.cam.x) * st.cam.zoom;
+                            float dzy0 = (py0 - st.cam.y) * st.cam.zoom;
+                            float dzx1 = (px1 - st.cam.x) * st.cam.zoom;
+                            float dzy1 = (py1 - st.cam.y) * st.cam.zoom;
+                            dl->AddRect(ImVec2(dzx0, dzy0), ImVec2(dzx1, dzy1),
+                                        IM_COL32(80, 200, 80, 120), 0.0f, 0, 1.5f);
+                            dl->AddRectFilled(ImVec2(dzx0, dzy0), ImVec2(dzx1, dzy1),
+                                              IM_COL32(80, 200, 80, 20));
+                        }
+                    }
                 }
             }
         }
@@ -3078,7 +3216,7 @@ int main(int argc, char *argv[])
         // Map start position markers above sprites (foreground draw list).
         if (st.showMapStartPositions)
         {
-            ImDrawList *dl = ImGui::GetForegroundDrawList();
+            ImDrawList *dl = ImGui::GetBackgroundDrawList();
             ImTextureID tileTexId = (ImTextureID)(intptr_t)tileAtlas[0];
             for (int m = 0; m < MAP_NBR_MAPS; m++)
             {

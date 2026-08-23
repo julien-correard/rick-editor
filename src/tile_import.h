@@ -224,18 +224,20 @@ inline bool importTilesBatchFromImage(const fs::path &path, int bank, int startT
     result.skippedOverflow = totalCells - toImport;
 
     int stride = w * 4;
+    int nextTile = startTile;
     for (int n = 0; n < toImport; n++)
     {
         int r = n / result.cols, c = n % result.cols;
-        int idx = startTile + n;
         const unsigned char *cellStart = data + (size_t)(r * 8) * stride + (size_t)(c * 8) * 4;
         if (isCellUniformRGBA(cellStart, stride, 8, 8)) { result.skippedUniform++; continue; }
-        encodeTileFromRGBA8x8(cellStart, stride, tiles_data[bank][idx]);
+        if (nextTile > 255) { result.skippedOverflow++; continue; }
+        encodeTileFromRGBA8x8(cellStart, stride, tiles_data[bank][nextTile]);
+        nextTile++;
         result.imported++;
     }
     stbi_image_free(data);
 
-    result.endTile = toImport > 0 ? startTile + toImport - 1 : -1;
+    result.endTile = nextTile > startTile ? nextTile - 1 : -1;
     err.clear();
     return true;
 }

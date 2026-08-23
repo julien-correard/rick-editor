@@ -177,19 +177,21 @@ inline bool importSpritesBatchFromImage(const fs::path &path, int startSprite, S
     result.skippedOverflow = totalCells - toImport;
 
     int stride = w * 4;
+    int nextSprite = startSprite;
     for (int n = 0; n < toImport; n++)
     {
         int r = n / result.cols, c = n % result.cols;
-        int idx = startSprite + n;
         const unsigned char *cellStart = data + (size_t)(r * SPRITE_H) * stride + (size_t)(c * SPRITE_W) * 4;
         if (isCellUniformRGBA(cellStart, stride, SPRITE_W, SPRITE_H) || isCellFullyTransparent(cellStart, stride, SPRITE_W, SPRITE_H))
         { result.skippedUniform++; continue; }
-        encodeSpriteFromRGBA(cellStart, stride, sprites_data[idx]);
+        if (nextSprite >= SPRITES_NBR_SPRITES) { result.skippedOverflow++; continue; }
+        encodeSpriteFromRGBA(cellStart, stride, sprites_data[nextSprite]);
+        nextSprite++;
         result.imported++;
     }
     stbi_image_free(data);
 
-    result.endSprite = toImport > 0 ? startSprite + toImport - 1 : -1;
+    result.endSprite = nextSprite > startSprite ? nextSprite - 1 : -1;
     err.clear();
     return true;
 }
