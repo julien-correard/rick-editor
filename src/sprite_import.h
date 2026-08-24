@@ -208,7 +208,7 @@ inline bool loadSpritesFromXrickBinary(const fs::path &path, std::string &err)
     if (!readWholeFile(path, buf, err)) return false;
 
     size_t off = 0, size = 0;
-    if (!elf32_find_symbol_file_offset(buf, "sprites_data", off, size, err)) return false;
+    if (!find_symbol_file_offset(buf, "sprites_data", off, size, err)) return false;
     size_t expected = sizeof(sprites_data);
     if (size != expected)
     {

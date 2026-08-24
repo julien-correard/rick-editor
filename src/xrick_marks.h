@@ -60,7 +60,7 @@
 #include <fstream>
 #include <algorithm>
 
-#include "xrick_levels.h" // submapStartRow, ConnectionsData, elf32_* helpers, connections_default.h
+#include "xrick_levels.h" // submapStartRow, ConnectionsData, find_symbol_file_offset / patch_symbol helpers, connections_default.h
 #include "xrick_eflg.h"   // EflgData, repackEflg -- patched alongside sprites/connections below
 #include "tiles.h"        // tile_t, tiles_data[][] -- persisted (banks 1/2) alongside eflg below
 #include "sprites.h"      // sprite_t, sprites_data[], SPRITES_NBR_SPRITES -- persisted below too
@@ -249,7 +249,7 @@ inline bool loadXrickMarks(const fs::path &path, const ConnectionsData &conn, Ma
     if (buf.empty()) { err = "File is empty or unreadable"; return false; }
 
     size_t off = 0, size = 0;
-    if (!elf32_find_symbol_file_offset(buf, "map_submaps", off, size, err)) return false;
+    if (!find_symbol_file_offset(buf, "map_submaps", off, size, err)) return false;
     if (size != (size_t)MAP_NBR_SUBMAPS * 8) { err = "map_submaps size mismatch"; return false; }
     std::array<SubmapRaw, MAP_NBR_SUBMAPS> rawSubmaps;
     for (int i = 0; i < MAP_NBR_SUBMAPS; i++)
@@ -263,7 +263,7 @@ inline bool loadXrickMarks(const fs::path &path, const ConnectionsData &conn, Ma
     }
 
     size_t moff = 0, msize = 0;
-    if (!elf32_find_symbol_file_offset(buf, "map_marks", moff, msize, err)) return false;
+    if (!find_symbol_file_offset(buf, "map_marks", moff, msize, err)) return false;
     if (msize != (size_t)MAP_NBR_MARKS * 5)
     {
         err = "map_marks has an unexpected size (" + std::to_string(msize) + " bytes) -- incompatible xrick build.";
@@ -665,7 +665,11 @@ inline bool loadMapFileWithSprites(const fs::path &path, ConnectionsData &conn, 
     return true;
 }
 
-inline PatchResult patchXrickBinaryWithSprites(const fs::path &xrickPath, ConnectionsData &conn, MarksData &marks, const EflgData &eflg, const std::array<ImapText, SCREEN_IMAPTEXT_COUNT> &texts)
+inline PatchResult patchXrickBinaryWithSprites(
+    const fs::path &xrickPath, ConnectionsData &conn, MarksData &marks,
+    const EflgData &eflg, const std::array<ImapText, SCREEN_IMAPTEXT_COUNT> &texts,
+    const std::vector<std::pair<const char*, size_t>> &textSlots = {},
+    const std::vector<std::vector<uint8_t>> &textEncoded = {})
 {
     std::string err;
     if (!repackConnections(conn, err))
@@ -698,18 +702,18 @@ inline PatchResult patchXrickBinaryWithSprites(const fs::path &xrickPath, Connec
     if (buf.empty()) { res.message = "File is empty or unreadable"; return res; }
 
     std::vector<uint8_t> bnumsBytes = map_bnums_as_bytes();
-    if (!elf32_patch_symbol(buf, "map_bnums", bnumsBytes.data(), bnumsBytes.size(), err))
+    if (!patch_symbol(buf, "map_bnums", bnumsBytes.data(), bnumsBytes.size(), err))
     { res.message = "Could not patch the level layout: " + err; return res; }
-    if (!elf32_patch_symbol(buf, "map_submaps", conn.packedSubmaps.data(), conn.packedSubmaps.size(), err))
+    if (!patch_symbol(buf, "map_submaps", conn.packedSubmaps.data(), conn.packedSubmaps.size(), err))
     { res.message = "Could not patch map_submaps: " + err; return res; }
-    if (!elf32_patch_symbol(buf, "map_connect", conn.packedConnect.data(), conn.packedConnect.size(), err))
+    if (!patch_symbol(buf, "map_connect", conn.packedConnect.data(), conn.packedConnect.size(), err))
     { res.message = "Could not patch map_connect: " + err; return res; }
     // Patch map_maps (per-map start positions). Each entry is 12
     // bytes: {U16 x, U16 y, U16 row, U16 submap, char *tune}.
     // We read the existing tune pointers and preserve them.
     {
         size_t moff = 0, msize = 0;
-        if (elf32_find_symbol_file_offset(buf, "map_maps", moff, msize, err)
+        if (find_symbol_file_offset(buf, "map_maps", moff, msize, err)
             && msize >= (size_t)MAP_NBR_MAPS * 12)
         {
             std::vector<uint8_t> patched(MAP_NBR_MAPS * 12);
@@ -735,28 +739,39 @@ inline PatchResult patchXrickBinaryWithSprites(const fs::path &xrickPath, Connec
             std::memcpy(buf.data() + moff, patched.data(), MAP_NBR_MAPS * 12);
         }
     }
-    if (!elf32_patch_symbol(buf, "map_marks", marks.packedMarks.data(), marks.packedMarks.size(), err))
+    if (!patch_symbol(buf, "map_marks", marks.packedMarks.data(), marks.packedMarks.size(), err))
     { res.message = "Could not patch map_marks: " + err; return res; }
-    if (!elf32_patch_symbol(buf, "map_eflg_c", eflgPacked, MAP_NBR_EFLGC, err))
+    if (!patch_symbol(buf, "map_eflg_c", eflgPacked, MAP_NBR_EFLGC, err))
     { res.message = "Could not patch map_eflg_c (tile hazard flags): " + err; return res; }
-    if (!elf32_patch_symbol(buf, "tiles_data", tiles_data, sizeof(tiles_data), err))
+    if (!patch_symbol(buf, "tiles_data", tiles_data, sizeof(tiles_data), err))
     { res.message = "Could not patch tiles_data (tile graphics): " + err; return res; }
     std::vector<uint8_t> blocksBytes = map_blocks_as_bytes();
-    if (!elf32_patch_symbol(buf, "map_blocks", blocksBytes.data(), blocksBytes.size(), err))
+    if (!patch_symbol(buf, "map_blocks", blocksBytes.data(), blocksBytes.size(), err))
     { res.message = "Could not patch map_blocks (block composition): " + err; return res; }
-    if (!elf32_patch_symbol(buf, "sprites_data", sprites_data, sizeof(sprites_data), err))
+    if (!patch_symbol(buf, "sprites_data", sprites_data, sizeof(sprites_data), err))
     { res.message = "Could not patch sprites_data (sprite graphics): " + err; return res; }
     for (int i = 0; i < SCREEN_IMAPTEXT_COUNT; i++)
     {
         size_t off = 0, symSize = 0;
-        if (!elf32_find_symbol_file_offset(buf, SCREEN_IMAPTEXT_SYMBOLS[i], off, symSize, err))
+        if (!find_symbol_file_offset(buf, SCREEN_IMAPTEXT_SYMBOLS[i], off, symSize, err))
         { res.message = "Could not patch " + std::string(SCREEN_IMAPTEXT_SYMBOLS[i]) + " (intro text): " + err; return res; }
         std::vector<uint8_t> textBytes;
         if (!encodeImapTextPadded(texts[i], symSize, textBytes, err))
         { res.message = "Could not patch " + std::string(SCREEN_IMAPTEXT_SYMBOLS[i])
             + " (" + SCREEN_IMAPTEXT_LABELS[i] + "): " + err; return res; }
-        if (!elf32_patch_symbol(buf, SCREEN_IMAPTEXT_SYMBOLS[i], textBytes.data(), textBytes.size(), err))
+        if (!patch_symbol(buf, SCREEN_IMAPTEXT_SYMBOLS[i], textBytes.data(), textBytes.size(), err))
         { res.message = "Could not patch " + std::string(SCREEN_IMAPTEXT_SYMBOLS[i]) + " (intro text): " + err; return res; }
+    }
+    // Patch additional ASCII text screens (e.g. copyright, game over, pause)
+    for (size_t i = 0; i < textSlots.size() && i < textEncoded.size(); i++)
+    {
+        size_t off = 0, symSize = 0;
+        std::string lerr;
+        if (!find_symbol_file_offset(buf, textSlots[i].first, off, symSize, lerr))
+            continue; // skip if symbol not found
+        std::vector<uint8_t> padded = textEncoded[i];
+        padded.resize(symSize, 0x00);
+        std::memcpy(buf.data() + off, padded.data(), symSize);
     }
 
     fs::path outPath = xrickPath;

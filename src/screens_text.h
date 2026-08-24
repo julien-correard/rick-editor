@@ -31,7 +31,7 @@
 #include <vector>
 
 #include "screens_text_data.h" // U8, SCREEN_IMAPTEXT_COUNT, extern screen_imaptext_*[] (see src/dat_screens.c)
-#include "xrick_patch.h"       // elf32_find_symbol_file_offset, elf32_patch_symbol
+#include "xrick_patch.h"       // find_symbol_file_offset, patch_symbol
 
 // Noms courts pour l'UI, dans le meme ordre que screen_imaptext[] (donc
 // que game_map, l'indice utilise par le jeu pour choisir quel texte
@@ -194,7 +194,7 @@ inline bool loadScreenTextsFromXrickBinary(const fs::path &path, std::array<Imap
     for (int i = 0; i < SCREEN_IMAPTEXT_COUNT; i++)
     {
         size_t off = 0, size = 0;
-        if (!elf32_find_symbol_file_offset(buf, SCREEN_IMAPTEXT_SYMBOLS[i], off, size, err)) return false;
+        if (!find_symbol_file_offset(buf, SCREEN_IMAPTEXT_SYMBOLS[i], off, size, err)) return false;
         if (off >= buf.size()) { err = std::string(SCREEN_IMAPTEXT_SYMBOLS[i]) + " location falls outside the file"; return false; }
         // parseImapText() s'arrete au 0xFE rencontre -- garanti present
         // dans les `size` premiers octets pour un binaire bien forme,

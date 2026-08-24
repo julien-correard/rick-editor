@@ -43,7 +43,7 @@
 #include <fstream>
 #include <algorithm>
 
-#include "xrick_patch.h" // elf32_find_symbol_file_offset, elf32_patch_symbol
+#include "xrick_patch.h" // find_symbol_file_offset, patch_symbol
 #include "connections_default.h"
 
 static const int MAP_NBR_SUBMAPS = 0x2F; // 47
@@ -141,7 +141,7 @@ inline bool loadXrickConnections(const fs::path &path, ConnectionsData &out, std
     if (buf.empty()) { err = "File is empty or unreadable"; return false; }
 
     size_t off = 0, size = 0;
-    if (!elf32_find_symbol_file_offset(buf, "map_submaps", off, size, err)) return false;
+    if (!find_symbol_file_offset(buf, "map_submaps", off, size, err)) return false;
     if (size != (size_t)MAP_NBR_SUBMAPS * 8)
     {
         err = "map_submaps has an unexpected size (" + std::to_string(size) + " bytes) -- incompatible xrick build.";
@@ -159,7 +159,7 @@ inline bool loadXrickConnections(const fs::path &path, ConnectionsData &out, std
     }
 
     size_t coff = 0, csize = 0;
-    if (!elf32_find_symbol_file_offset(buf, "map_connect", coff, csize, err)) return false;
+    if (!find_symbol_file_offset(buf, "map_connect", coff, csize, err)) return false;
     if (csize != (size_t)MAP_NBR_CONNECT * 4)
     {
         err = "map_connect has an unexpected size (" + std::to_string(csize) + " bytes) -- incompatible xrick build.";
@@ -175,7 +175,7 @@ inline bool loadXrickConnections(const fs::path &path, ConnectionsData &out, std
     // Each entry is 12 bytes: {U16 x, U16 y, U16 row, U16 submap, char *tune}.
     // We read the 8-byte numeric portion and skip the 4-byte tune pointer.
     size_t moff = 0, msize = 0;
-    if (elf32_find_symbol_file_offset(buf, "map_maps", moff, msize, err))
+    if (find_symbol_file_offset(buf, "map_maps", moff, msize, err))
     {
         if (msize >= (size_t)MAP_NBR_MAPS * 12)
         {
@@ -539,7 +539,7 @@ inline PatchResult patchXrickBinaryFull(const fs::path &xrickPath, ConnectionsDa
 
     std::string err;
     std::vector<uint8_t> bnumsBytes = map_bnums_as_bytes();
-    if (!elf32_patch_symbol(buf, "map_bnums", bnumsBytes.data(), bnumsBytes.size(), err))
+    if (!patch_symbol(buf, "map_bnums", bnumsBytes.data(), bnumsBytes.size(), err))
     {
         res.message = "Could not patch the level layout: " + err;
         return res;
@@ -553,12 +553,12 @@ inline PatchResult patchXrickBinaryFull(const fs::path &xrickPath, ConnectionsDa
             res.message = "Could not patch the screen connections: " + err;
             return res;
         }
-        if (!elf32_patch_symbol(buf, "map_submaps", conn->packedSubmaps.data(), conn->packedSubmaps.size(), err))
+        if (!patch_symbol(buf, "map_submaps", conn->packedSubmaps.data(), conn->packedSubmaps.size(), err))
         {
             res.message = "Could not patch map_submaps: " + err;
             return res;
         }
-        if (!elf32_patch_symbol(buf, "map_connect", conn->packedConnect.data(), conn->packedConnect.size(), err))
+        if (!patch_symbol(buf, "map_connect", conn->packedConnect.data(), conn->packedConnect.size(), err))
         {
             res.message = "Could not patch map_connect: " + err;
             return res;
@@ -570,7 +570,7 @@ inline PatchResult patchXrickBinaryFull(const fs::path &xrickPath, ConnectionsDa
         {
             size_t moff = 0, msize = 0;
             std::string merr;
-            if (elf32_find_symbol_file_offset(buf, "map_maps", moff, msize, merr)
+            if (find_symbol_file_offset(buf, "map_maps", moff, msize, merr)
                 && msize >= (size_t)MAP_NBR_MAPS * 12)
             {
                 // Read existing tune pointers (4 bytes at offset 8 of each 12-byte entry)

@@ -1,17 +1,17 @@
 /*
- * xrick/src/data/dat_screens.c -- PARTIAL port: only the map-intro TEXT
- * arrays (screen_imaptext_*) are ported here, verbatim from the
- * original source. The intro's animated-sprite list/steps/offsets
- * (screen_imapsl, screen_imapsteps, screen_imapsofs) and every other
- * screen (hall of fame title, Rick Dangerous title, pause, game over,
- * ...) are NOT ported -- out of scope for the Text Editor, which only
- * edits the between-levels text. See src/screens_text.h.
+ * xrick/src/data/dat_screens.c -- Port of screen data arrays from the
+ * original xrick source (rick/dat_screens.c). Includes:
+ * - Map intro text (screen_imaptext_*) -- edited via the Text Editor
+ * - ASCII text screens (screen_imaincdc, screen_gameovertxt, screen_pausedtxt) -- edited via the Assets Editor
+ * The animated-sprite list/steps/offsets (screen_imapsl, screen_imapsteps,
+ * screen_imapsofs) remain out of scope.
  *
  * Copyright (C) 1998-2002 BigOrno (bigorno@bigorno.net). All rights
  * reserved. See the original xrick README for license terms.
  */
 
 #include "screens_text_data.h"
+#include "screens_assets_data.h"
 
 /*
  * map intro, text
@@ -81,5 +81,37 @@ U8 *screen_imaptext[5] =
   screen_imaptext_missile,
   screen_imaptext_muchlater
 };
+
+/*
+ * main intro, Core Design copyright text
+ * (from ds + 0x8810 + 0x2288)
+ *
+ * \376=0xfe \377=0xff
+ */
+U8 screen_imaincdc[] = "\
+@@@@@@@@@@@@@@@@@@@\377\377\
+(C)@1989@CORE@DESIGN\377\377\377\
+@PRESS@SPACE@TO@START\376";
+
+/*
+ * gameover
+ * (from ds + 0x8810 + 0x2864)
+ *
+ * \376=0xfe \377=0xff
+ */
+U8 screen_gameovertxt[] = "\
+@@@@@@@@@@@\377\
+@GAME@OVER@\377\
+@@@@@@@@@@@\376";
+
+/*
+ * paused
+ *
+ * \376=0xfe \377=0xff
+ */
+U8 screen_pausedtxt[] = "\
+@@@@@@@@@@\377\
+@@PAUSED@@\377\
+@@@@@@@@@@\376";
 
 /* eof */

@@ -37,6 +37,10 @@
 #include "tile_import.h"
 #include "sprite_import.h"
 #include "screens_text.h"
+#include "screens_assets.h"
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb/stb_image_write.h"
 
 namespace fs = std::filesystem;
 
@@ -333,7 +337,7 @@ struct TextEditorState
     int selected = 0; // 0-4, index into mapTexts[] / SCREEN_IMAPTEXT_LABELS[]
 };
 
-enum class DialogPurpose { OpenMap, SaveMap, PickXrickBinary, PickXrickBinaryForConnections, ImportTileImage, BatchImportTileImage, ImportSpriteImage, BatchImportSpriteImage };
+enum class DialogPurpose { OpenMap, SaveMap, PickXrickBinary, PickXrickBinaryForConnections, ImportTileImage, BatchImportTileImage, ImportSpriteImage, BatchImportSpriteImage, ExportTileBankPNG, ExportSpritePNG, ImportBank0Image, BatchImportBank0Image, ExportPicPNG, ImportPicImage };
 
 struct FileDialog
 {
@@ -550,6 +554,10 @@ static bool renderFileDialog(FileDialog &fd, fs::path &outPath)
                        : fd.purpose == DialogPurpose::BatchImportTileImage ? "Batch import tile image"
                        : fd.purpose == DialogPurpose::ImportSpriteImage ? "Import sprite image"
                        : fd.purpose == DialogPurpose::BatchImportSpriteImage ? "Batch import sprite image"
+                       : fd.purpose == DialogPurpose::ExportTileBankPNG ? "Export tile bank as PNG"
+                       : fd.purpose == DialogPurpose::ExportSpritePNG ? "Export sprites as PNG"
+                       : fd.purpose == DialogPurpose::ImportBank0Image ? "Import tile image (bank 0)"
+                       : fd.purpose == DialogPurpose::BatchImportBank0Image ? "Batch import tile image (bank 0)"
                        : fd.saveMode ? "Save As" : "Open Map";
     ImGui::OpenPopup(title);
 
@@ -610,12 +618,16 @@ static bool renderFileDialog(FileDialog &fd, fs::path &outPath)
             ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", fd.error.c_str());
 
         const char* confirmLabel = fd.purpose == DialogPurpose::PickXrickBinary ? "Select"
-                                  : fd.purpose == DialogPurpose::PickXrickBinaryForConnections ? "Select"
-                                  : fd.purpose == DialogPurpose::ImportTileImage ? "Import"
-                                  : fd.purpose == DialogPurpose::BatchImportTileImage ? "Import"
-                                  : fd.purpose == DialogPurpose::ImportSpriteImage ? "Import"
-                                  : fd.purpose == DialogPurpose::BatchImportSpriteImage ? "Import"
-                                  : fd.saveMode ? "Save" : "Open";
+                                   : fd.purpose == DialogPurpose::PickXrickBinaryForConnections ? "Select"
+                                   : fd.purpose == DialogPurpose::ImportTileImage ? "Import"
+                                   : fd.purpose == DialogPurpose::BatchImportTileImage ? "Import"
+                                   : fd.purpose == DialogPurpose::ImportSpriteImage ? "Import"
+                                   : fd.purpose == DialogPurpose::BatchImportSpriteImage ? "Import"
+                                   : fd.purpose == DialogPurpose::ExportTileBankPNG ? "Export"
+                                   : fd.purpose == DialogPurpose::ExportSpritePNG ? "Export"
+                                   : fd.purpose == DialogPurpose::ImportBank0Image ? "Import"
+                                   : fd.purpose == DialogPurpose::BatchImportBank0Image ? "Import"
+                                   : fd.saveMode ? "Save" : "Open";
         if (ImGui::Button(confirmLabel, ImVec2(120, 0)))
         {
             std::string name = fd.filename;
@@ -758,6 +770,48 @@ static void rebuildSpriteAtlas(SDL_Renderer *renderer, SDL_Texture *&spriteAtlas
     spriteAtlas = build_sprite_atlas(renderer);
 }
 
+// Exports a tile bank as a PNG file. The image is a 128x128 atlas
+// (16x16 tiles of 8px each), same layout as the SDL texture atlas.
+static bool exportTileBankAsPNG(const fs::path &path, int bank)
+{
+    std::vector<Uint32> pixels(TILE_ATLAS_PX * TILE_ATLAS_PX, 0xFF000000u);
+    for (int t = 0; t < 0x100; t++)
+    {
+        Uint32 tile_px[TILE_PX * TILE_PX];
+        decode_tile(bank, t, tile_px);
+        int cx = (t % ATLAS_TILES_PER_ROW) * TILE_PX;
+        int cy = (t / ATLAS_TILES_PER_ROW) * TILE_PX;
+        for (int y = 0; y < TILE_PX; y++)
+            for (int x = 0; x < TILE_PX; x++)
+                pixels[(cy + y) * TILE_ATLAS_PX + (cx + x)] = tile_px[y * TILE_PX + x];
+    }
+    // stb_image_write expects top-to-bottom; our atlas is already in
+    // that order. Pixel format is ABGR in memory (0xAABBGGRR) which
+    // stbi_write_png interprets as RGBA when comp=4, matching our
+    // decode_tile() output layout.
+    return stbi_write_png(path.string().c_str(), TILE_ATLAS_PX, TILE_ATLAS_PX, 4,
+                          pixels.data(), TILE_ATLAS_PX * sizeof(Uint32)) != 0;
+}
+
+// Exports all sprites as a PNG file. The image is a sprite sheet
+// (16 sprites per row, SPRITE_ATLAS_ROWS rows).
+static bool exportSpritesAsPNG(const fs::path &path)
+{
+    std::vector<Uint32> pixels(SPRITE_ATLAS_W * SPRITE_ATLAS_H, 0);
+    for (int n = 0; n < SPRITES_NBR_SPRITES; n++)
+    {
+        Uint32 spr[SPRITE_W * SPRITE_H];
+        decode_sprite(n, spr);
+        int cx = (n % SPRITE_ATLAS_PER_ROW) * SPRITE_W;
+        int cy = (n / SPRITE_ATLAS_PER_ROW) * SPRITE_H;
+        for (int y = 0; y < SPRITE_H; y++)
+            for (int x = 0; x < SPRITE_W; x++)
+                pixels[(cy + y) * SPRITE_ATLAS_W + (cx + x)] = spr[y * SPRITE_W + x];
+    }
+    return stbi_write_png(path.string().c_str(), SPRITE_ATLAS_W, SPRITE_ATLAS_H, 4,
+                          pixels.data(), SPRITE_ATLAS_W * sizeof(Uint32)) != 0;
+}
+
 int main(int argc, char *argv[])
 {
     (void)argc; (void)argv;
@@ -794,12 +848,25 @@ int main(int argc, char *argv[])
     PixelEditorState pixelEditor;
     BlockEditorState blockEditor;
     SpriteEditorState spriteEditor;
+    AssetsEditorState assetsEditor;
+    assetsEditor.loadDefaults();
     TextEditorState textEditor;
     FileDialog fileDialog;
     ConnectionsData connections = defaultConnections();
     MarksData sprites = defaultMarks();
     EflgData eflg = defaultEflg();
     std::array<ImapText, SCREEN_IMAPTEXT_COUNT> mapTexts = defaultImapTexts();
+
+    // Center the camera on map start position 1 at startup
+    {
+        int vw, vh; SDL_GetRendererOutputSize(renderer, &vw, &vh);
+        const MapStartInfo &ms0 = connections.mapStarts[0];
+        float worldX = (float)ms0.x;
+        float worldY = (float)((ms0.row + 17) * TILE_PX); // +17 = SCRTOP offset, same as marker rendering
+        st.cam.x = worldX - vw / (2.0f * st.cam.zoom);
+        st.cam.y = worldY - vh / (2.0f * st.cam.zoom);
+    }
+
     std::string patchResultMessage;
     bool patchResultOk = false;
     updateWindowTitle(window, st);
@@ -816,7 +883,7 @@ int main(int argc, char *argv[])
                 && event.window.windowID == SDL_GetWindowID(window)) running = false;
 
             bool mouseWantedByUI = io.WantCaptureMouse;
-            bool kbWantedByUI = io.WantCaptureKeyboard;
+            bool kbWantedByUI = io.WantTextInput;
 
             if (!mouseWantedByUI)
             {
@@ -1220,6 +1287,15 @@ int main(int argc, char *argv[])
                 ImGui::MenuItem("Map start positions", nullptr, &st.showMapStartPositions);
                 ImGui::EndMenu();
             }
+            if (ImGui::BeginMenu("Tools"))
+            {
+                ImGui::MenuItem("Tile Editor", nullptr, &tileEditor.open);
+                ImGui::MenuItem("Block Editor", nullptr, &blockEditor.open);
+                ImGui::MenuItem("Sprite Editor", nullptr, &spriteEditor.open);
+                ImGui::MenuItem("Assets Editor", nullptr, &assetsEditor.open);
+                ImGui::MenuItem("Text Editor", nullptr, &textEditor.open);
+                ImGui::EndMenu();
+            }
             if (!st.currentPath.empty())
                 ImGui::Text("  %s%s", st.currentPath.filename().string().c_str(), st.dirty ? " *" : "");
             ImGui::EndMainMenuBar();
@@ -1280,23 +1356,25 @@ int main(int argc, char *argv[])
             }
 
             divider();
-            ImGui::Checkbox("Tile Editor", &tileEditor.open);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Edit individual tile graphics (import from image) and their hazard flags -- independent of the map canvas");
-            wrap();
-            ImGui::Checkbox("Block Editor", &blockEditor.open);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Compose blocks out of tiles (map_blocks) -- independent of the map canvas");
-            wrap();
-            ImGui::Checkbox("Sprite Editor", &spriteEditor.open);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Edit sprite graphics (import from image, single or batch) -- independent of the map canvas");
-            wrap();
-            ImGui::Checkbox("Text Editor", &textEditor.open);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Edit the 5 between-levels intro texts -- independent of the map canvas");
-            wrap();
-
-            divider();
             ImGui::Checkbox("Grid", &st.showGrid);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show the block grid (one square = one block) -- G");
             wrap();
+
+            divider();
+            for (int i = 0; i < 4; i++)
+            {
+                ImGui::PushID(9000 + i);
+                if (ImGui::SmallButton(std::to_string(i + 1).c_str()))
+                {
+                    int vw, vh; SDL_GetRendererOutputSize(renderer, &vw, &vh);
+                    const MapStartInfo &ms0 = connections.mapStarts[i];
+                    st.cam.x = (float)ms0.x - vw / (2.0f * st.cam.zoom);
+                    st.cam.y = (float)((ms0.row + 17) * TILE_PX) - vh / (2.0f * st.cam.zoom);
+                }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Scroll to map start %d", i + 1);
+                wrap();
+                ImGui::PopID();
+            }
 
             divider();
             if (ImGui::SmallButton("-")) zoomAt(st, viewportW / 2.0f, viewportH / 2.0f, 1.0f / 1.25f);
@@ -1327,10 +1405,12 @@ int main(int argc, char *argv[])
                 int mx, my; SDL_GetMouseState(&mx, &my);
                 int col, row;
                 screenToCell(st, (float)mx, (float)my, col, row);
+                int tileCol = std::clamp(screenToTileCol(st, (float)mx), 0, 31);
+                int tileRow = screenToTileRow(st, (float)my);
                 if (cellValid(col, row))
-                    ImGui::Text("col %d, row %d (index %d) -- tile row %d", col, row, mapIndex(col, row), screenToTileRow(st, (float)my));
+                    ImGui::Text("col %d, row %d (index %d) -- tile col %d, tile row %d", col, row, mapIndex(col, row), tileCol, tileRow);
                 else
-                    ImGui::Text("out of map -- tile row %d", screenToTileRow(st, (float)my));
+                    ImGui::Text("out of map -- tile col %d, tile row %d", tileCol, tileRow);
             }
 
             toolbarH = ImGui::GetWindowHeight();
@@ -1363,22 +1443,30 @@ int main(int argc, char *argv[])
                     if (loadMapFileWithSprites(chosenPath, connections, sprites, eflg, mapTexts, err))
                     {
                         st.currentPath = chosenPath; st.dirty = false; st.sel.active = false;
-                        // Harmless no-op if this file predates RKM6/RKM7/
-                        // RKM8/RKM9/RKMA (tile graphics/block composition/
-                        // sprite graphics/intro text/bank-0 tile graphics
-                        // unchanged) -- always rebuilding is simpler than
-                        // tracking whether they actually moved, and this
-                        // only runs once per Open.
                         rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 0);
                         rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 1);
                         rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 2);
                         rebuildSpriteAtlas(renderer, spriteAtlas);
+                        // Center on map start position 1
+                        int vw, vh; SDL_GetRendererOutputSize(renderer, &vw, &vh);
+                        const MapStartInfo &ms0 = connections.mapStarts[0];
+                        st.cam.x = (float)ms0.x - vw / (2.0f * st.cam.zoom);
+                        st.cam.y = (float)((ms0.row + 17) * TILE_PX) - vh / (2.0f * st.cam.zoom);
                     }
                     else fileDialog.error = err;
                     break;
                 case DialogPurpose::PickXrickBinary:
                 {
-                    PatchResult r = patchXrickBinaryWithSprites(chosenPath, connections, sprites, eflg, mapTexts);
+                    // Encode ASCII text screens before patching
+                    std::vector<std::vector<uint8_t>> textEncoded(3);
+                    std::vector<std::pair<const char*, size_t>> textSlots;
+                    for (int i = 0; i < 3; i++)
+                    {
+                        textEncoded[i] = encodeAsciiTextScreen(assetsEditor.asciiScreens[i]);
+                        textSlots.push_back({ASCII_TEXT_SCREEN_SYMBOLS[i], ASCII_TEXT_SCREEN_SIZES[i]});
+                    }
+                    PatchResult r = patchXrickBinaryWithSprites(chosenPath, connections, sprites, eflg, mapTexts,
+                        textSlots, textEncoded);
                     patchResultMessage = r.message;
                     patchResultOk = r.ok;
                     ImGui::OpenPopup("Result");
@@ -1394,6 +1482,7 @@ int main(int argc, char *argv[])
                     if (ok) ok = loadBlocksFromXrickBinary(chosenPath, cerr);
                     if (ok) ok = loadSpritesFromXrickBinary(chosenPath, cerr);
                     if (ok) ok = loadScreenTextsFromXrickBinary(chosenPath, mapTexts, cerr);
+                    if (ok) loadAssetsFromXrickBinary(chosenPath, assetsEditor, cerr);
                     if (ok)
                     {
                         rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 0);
@@ -1406,7 +1495,7 @@ int main(int argc, char *argv[])
                           "hazard flags + tile graphics + block composition + sprite graphics + intro text) from "
                           + chosenPath.filename().string()
                           + ". See the \"Screen Connections\", \"Sprite Tools\", Block Palette, Tile Editor, "
-                            "Block Editor, Sprite Editor, and Text Editor windows."
+                            "Block Editor, Sprite Editor, Text Editor, and Assets Editor windows."
                         : cerr;
                     patchResultOk = ok;
                     ImGui::OpenPopup("Result");
@@ -1518,6 +1607,127 @@ int main(int argc, char *argv[])
                     }
                     else patchResultMessage = ierr;
                     patchResultOk = ok;
+                    ImGui::OpenPopup("Result");
+                    break;
+                }
+                case DialogPurpose::ExportTileBankPNG:
+                {
+                    bool ok = exportTileBankAsPNG(chosenPath, 0);
+                    patchResultMessage = ok
+                        ? "Exported bank 0 tiles to " + chosenPath.filename().string() + "."
+                        : "Failed to write " + chosenPath.filename().string() + ".";
+                    patchResultOk = ok;
+                    ImGui::OpenPopup("Result");
+                    break;
+                }
+                case DialogPurpose::ExportSpritePNG:
+                {
+                    bool ok = exportSpritesAsPNG(chosenPath);
+                    patchResultMessage = ok
+                        ? "Exported sprites to " + chosenPath.filename().string() + "."
+                        : "Failed to write " + chosenPath.filename().string() + ".";
+                    patchResultOk = ok;
+                    ImGui::OpenPopup("Result");
+                    break;
+                }
+                case DialogPurpose::ImportBank0Image:
+                {
+                    std::string ierr;
+                    bool ok = assetsEditor.selectedTile >= 0
+                        && importTileFromImage(chosenPath, tiles_data[0][assetsEditor.selectedTile], ierr);
+                    if (ok)
+                    {
+                        rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 0);
+                        st.dirty = true;
+                        patchResultMessage = "Imported " + chosenPath.filename().string() + " into tile "
+                            + std::to_string(assetsEditor.selectedTile) + " (bank 0).";
+                    }
+                    else patchResultMessage = ierr.empty() ? "No tile selected." : ierr;
+                    patchResultOk = ok;
+                    ImGui::OpenPopup("Result");
+                    break;
+                }
+                case DialogPurpose::BatchImportBank0Image:
+                {
+                    std::string ierr;
+                    BatchImportResult br;
+                    bool ok = importTilesBatchFromImage(chosenPath, 0, assetsEditor.batchStartTile, br, ierr);
+                    if (ok)
+                    {
+                        if (br.imported > 0)
+                        {
+                            rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 0);
+                            st.dirty = true;
+                        }
+                        std::string msg = "Batch import from " + chosenPath.filename().string() + ": detected a "
+                            + std::to_string(br.cols) + "x" + std::to_string(br.rows) + " grid of tiles (bank 0).\n";
+                        if (br.imported > 0)
+                            msg += "Imported " + std::to_string(br.imported) + " tile(s), into "
+                                + std::to_string(br.startTile) + "-" + std::to_string(br.endTile) + ".\n";
+                        else
+                            msg += "No tiles imported.\n";
+                        if (br.skippedOverflow > 0)
+                            msg += std::to_string(br.skippedOverflow) + " tile(s) skipped: ran past tile 255 "
+                                "(start tile " + std::to_string(br.startTile) + " + " + std::to_string(br.cols * br.rows)
+                                + " image tiles overflows the bank).\n";
+                        if (br.skippedUniform > 0)
+                            msg += std::to_string(br.skippedUniform) + " tile(s) skipped: empty cell (all pixels "
+                                "the same color) -- left whatever was already at that tile.\n";
+                        if (br.leftoverPixelsX > 0 || br.leftoverPixelsY > 0)
+                            msg += "Image size isn't a multiple of 8 -- ignored " + std::to_string(br.leftoverPixelsX)
+                                + "px on the right and " + std::to_string(br.leftoverPixelsY) + "px at the bottom.";
+                        patchResultMessage = msg;
+                    }
+                    else patchResultMessage = ierr;
+                    patchResultOk = ok;
+                    ImGui::OpenPopup("Result");
+                    break;
+                }
+                case DialogPurpose::ExportPicPNG:
+                {
+                    int pi = assetsEditor.exportPicIdx;
+                    if (pi < 0 || pi >= PIC_COUNT || assetsEditor.pics.pics[pi].empty())
+                    {
+                        patchResultMessage = "No picture data to export.";
+                        patchResultOk = false;
+                    }
+                    else
+                    {
+                        const BitmapPic &pic = assetsEditor.pics.pics[pi];
+                        bool ok = stbi_write_png(chosenPath.string().c_str(), pic.w, pic.h, 4,
+                                                  pic.pixels.data(), pic.w * sizeof(uint32_t));
+                        patchResultMessage = ok
+                            ? "Exported " + std::string(PIC_LABELS[pi]) + " as " + chosenPath.filename().string()
+                            : "Failed to write PNG.";
+                        patchResultOk = ok;
+                    }
+                    ImGui::OpenPopup("Result");
+                    break;
+                }
+                case DialogPurpose::ImportPicImage:
+                {
+                    int pi = assetsEditor.importPicIdx;
+                    if (pi < 0 || pi >= PIC_COUNT)
+                    {
+                        patchResultMessage = "No picture slot selected.";
+                        patchResultOk = false;
+                    }
+                    else
+                    {
+                        std::string ierr;
+                        bool ok = importPicFromImage(chosenPath, assetsEditor.pics.pics[pi],
+                                                     PIC_W[pi], PIC_H[pi], ierr);
+                        if (ok)
+                        {
+                            assetsEditor.pics.loaded[pi] = true;
+                            st.dirty = true;
+                            patchResultMessage = "Imported " + chosenPath.filename().string()
+                                + " into " + std::string(PIC_LABELS[pi]) + " (resampled to "
+                                + std::to_string(PIC_W[pi]) + "x" + std::to_string(PIC_H[pi]) + ").";
+                        }
+                        else patchResultMessage = ierr.empty() ? "Import failed." : ierr;
+                        patchResultOk = ok;
+                    }
                     ImGui::OpenPopup("Result");
                     break;
                 }
@@ -2410,6 +2620,244 @@ int main(int argc, char *argv[])
                 }
             }
             ImGui::EndChild();
+
+            ImGui::Separator();
+            if (ImGui::Button("Export all sprites as PNG..."))
+            {
+                fileDialog.show = true;
+                fileDialog.saveMode = true;
+                fileDialog.purpose = DialogPurpose::ExportSpritePNG;
+                fileDialog.extFilter = {".png"};
+                std::snprintf(fileDialog.filename, sizeof fileDialog.filename, "sprites.png");
+                fileDialog.error.clear();
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Export all %d sprites as a PNG sprite sheet (%dx%d)",
+                                                            SPRITES_NBR_SPRITES, SPRITE_ATLAS_W, SPRITE_ATLAS_H);
+
+            ImGui::End();
+        }
+
+        // --- Assets Editor -- standalone window for editing screen
+        // graphics beyond tiles/sprites/blocks: bank 0 tile grid,
+        // logo tile streams, ASCII text screens, and bitmap pictures. ---
+        if (assetsEditor.open)
+        {
+            ImGui::SetNextWindowSize(ImVec2(640, 600), ImGuiCond_FirstUseEver);
+            ImGui::Begin("Assets Editor", &assetsEditor.open);
+
+            ImGui::TextDisabled("Screen graphics: bank 0 tiles, logo titles, text screens, and bitmap pictures");
+            ImGui::Separator();
+
+            // --- Bank 0 tile grid ---
+            if (ImGui::CollapsingHeader("Bank 0 Tiles (font / cutscene decor)", ImGuiTreeNodeFlags_DefaultOpen))
+            {
+                ImGui::Indent();
+                ImGui::TextDisabled("256 tiles, 8x8 pixels each. Bank 0 is the font used by all text screens "
+                                     "and the cutscene decor backgrounds.");
+                if (ImGui::CollapsingHeader("Batch import..."))
+                {
+                    ImGui::Indent();
+                    ImGui::TextWrapped("Slices one image into consecutive 8x8 tiles, left-to-right then "
+                                        "top-to-bottom, starting at the tile number below.");
+                    ImGui::SetNextItemWidth(100);
+                    ImGui::InputInt("Start tile", &assetsEditor.batchStartTile);
+                    assetsEditor.batchStartTile = std::clamp(assetsEditor.batchStartTile, 0, 255);
+                    if (ImGui::Button("Choose image..."))
+                    {
+                        fileDialog.show = true;
+                        fileDialog.saveMode = false;
+                        fileDialog.purpose = DialogPurpose::BatchImportBank0Image;
+                        fileDialog.extFilter = {".png", ".bmp", ".tga", ".jpg", ".jpeg", ".gif", ".psd"};
+                        fileDialog.filename[0] = '\0';
+                        fileDialog.error.clear();
+                    }
+                    ImGui::Unindent();
+                }
+                // Tile grid + detail
+                float detailW = 160.0f;
+                ImGui::BeginChild("##bank0Grid", ImVec2(-detailW, 180), true);
+                {
+                    ImTextureID tileTexId = (ImTextureID)(intptr_t)tileAtlas[0];
+                    float thumb = 20.0f;
+                    ImGuiStyle &b0Style = ImGui::GetStyle();
+                    float b0WindowRight = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
+                    for (int t = 0; t < 0x100; t++)
+                    {
+                        ImGui::PushID(5000 + t);
+                        float u0 = (float)(t % ATLAS_TILES_PER_ROW) / ATLAS_TILES_PER_ROW;
+                        float v0 = (float)(t / ATLAS_TILES_PER_ROW) / ATLAS_TILES_PER_ROW;
+                        float u1 = u0 + 1.0f / ATLAS_TILES_PER_ROW;
+                        float v1 = v0 + 1.0f / ATLAS_TILES_PER_ROW;
+                        bool selected = (t == assetsEditor.selectedTile);
+                        if (selected) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.55f, 0.95f, 1.0f));
+                        if (ImGui::ImageButton("##b0t", tileTexId, ImVec2(thumb, thumb), ImVec2(u0, v0), ImVec2(u1, v1)))
+                        {
+                            assetsEditor.selectedTile = t;
+                            assetsEditor.batchStartTile = t;
+                        }
+                        if (selected) ImGui::PopStyleColor();
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Tile %d (0x%02X)", t, t);
+                        float nextRight = ImGui::GetItemRectMax().x + b0Style.ItemSpacing.x + ImGui::GetItemRectSize().x;
+                        if (t != 0xFF && nextRight < b0WindowRight) ImGui::SameLine();
+                        ImGui::PopID();
+                    }
+                }
+                ImGui::EndChild();
+                ImGui::SameLine();
+                ImGui::BeginChild("##bank0Detail", ImVec2(detailW, 180));
+                {
+                    if (assetsEditor.selectedTile < 0)
+                        ImGui::TextWrapped("Click a tile to select.");
+                    else
+                    {
+                        ImGui::Text("Tile %d", assetsEditor.selectedTile);
+                        ImTextureID tileTexId = (ImTextureID)(intptr_t)tileAtlas[0];
+                        float u0 = (float)(assetsEditor.selectedTile % ATLAS_TILES_PER_ROW) / ATLAS_TILES_PER_ROW;
+                        float v0 = (float)(assetsEditor.selectedTile / ATLAS_TILES_PER_ROW) / ATLAS_TILES_PER_ROW;
+                        float u1 = u0 + 1.0f / ATLAS_TILES_PER_ROW;
+                        float v1 = v0 + 1.0f / ATLAS_TILES_PER_ROW;
+                        ImGui::Image(tileTexId, ImVec2(96, 96), ImVec2(u0, v0), ImVec2(u1, v1));
+                        if (ImGui::SmallButton("Import..."))
+                        {
+                            fileDialog.show = true; fileDialog.saveMode = false;
+                            fileDialog.purpose = DialogPurpose::ImportBank0Image;
+                            fileDialog.extFilter = {".png", ".bmp", ".tga", ".jpg", ".jpeg", ".gif", ".psd"};
+                            fileDialog.filename[0] = '\0'; fileDialog.error.clear();
+                        }
+                        if (ImGui::SmallButton("Edit pixels"))
+                        {
+                            pixelEditor.open = true; pixelEditor.target = PixelEditorState::Tile;
+                            pixelEditor.bank = 0; pixelEditor.index = assetsEditor.selectedTile;
+                            pixelEditor.color = 1;
+                            std::memcpy(pixelEditor.backupTile, tiles_data[0][assetsEditor.selectedTile], sizeof(tile_t));
+                        }
+                        if (ImGui::SmallButton("Delete"))
+                        {
+                            for (int i = 0; i < 8; i++) tiles_data[0][assetsEditor.selectedTile][i] = 0;
+                            rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 0);
+                            st.dirty = true;
+                        }
+                    }
+                }
+                ImGui::EndChild();
+                if (ImGui::Button("Export bank 0 tiles as PNG..."))
+                {
+                    fileDialog.show = true; fileDialog.saveMode = true;
+                    fileDialog.purpose = DialogPurpose::ExportTileBankPNG;
+                    fileDialog.extFilter = {".png"};
+                    std::snprintf(fileDialog.filename, sizeof fileDialog.filename, "tiles_bank0.png");
+                    fileDialog.error.clear();
+                }
+                ImGui::Unindent();
+            }
+
+            // --- ASCII Text Screens ---
+            if (ImGui::CollapsingHeader("Text Screens (copyright, game over, pause)"))
+            {
+                ImGui::Indent();
+                ImGui::TextWrapped("Same encoding as the intro texts: '@' = space, 0xFF = newline, "
+                                    "0xFE = end. Each screen is a fixed-size slot in the binary.");
+                for (int i = 0; i < 3; i++)
+                {
+                    ImGui::PushID(7000 + i);
+                    AsciiTextScreen &ats = assetsEditor.asciiScreens[i];
+                    if (ImGui::TreeNode(ASCII_TEXT_SCREEN_LABELS[i]))
+                    {
+                        char buf[512];
+                        size_t n = std::min(ats.text.size(), sizeof(buf) - 1);
+                        std::memcpy(buf, ats.text.data(), n);
+                        buf[n] = '\0';
+                        ImGui::SetNextItemWidth(-1);
+                        if (ImGui::InputTextMultiline("##txt", buf, sizeof(buf), ImVec2(0, 80)))
+                            ats.text = buf;
+                        ImGui::TextDisabled("Slot size: %d bytes", (int)ASCII_TEXT_SCREEN_SIZES[i]);
+                        if (ImGui::SmallButton("Reset to default"))
+                        {
+                            if (i == 0) ats = defaultImainCDC();
+                            else if (i == 1) ats = defaultGameoverTxt();
+                            else ats = defaultPausedTxt();
+                        }
+                        ImGui::TreePop();
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::Unindent();
+            }
+
+            // --- Bitmap Pictures (pic_congrats, pic_haf, pic_splash) ---
+            if (ImGui::CollapsingHeader("Bitmap Pictures (title screen, backgrounds)"))
+            {
+                ImGui::Indent();
+                ImGui::TextWrapped("4-bit-per-pixel indexed images using the fixed 16-color ST palette. "
+                                    "Loaded from the xrick binary -- use \"Import from xrick binary\" "
+                                    "in the File menu to load them.");
+                for (int i = 0; i < PIC_COUNT; i++)
+                {
+                    ImGui::PushID(8000 + i);
+                    const BitmapPic &pic = assetsEditor.pics.pics[i];
+                    bool loaded = assetsEditor.pics.loaded[i];
+                    if (ImGui::TreeNode(PIC_LABELS[i]))
+                    {
+                        if (!loaded)
+                        {
+                            ImGui::TextDisabled("Not loaded from xrick binary.");
+                            ImGui::Text("Dimensions: %dx%d", PIC_W[i], PIC_H[i]);
+                            if (ImGui::Button("Import from image..."))
+                            {
+                                assetsEditor.importPicIdx = i;
+                                fileDialog.show = true; fileDialog.saveMode = false;
+                                fileDialog.purpose = DialogPurpose::ImportPicImage;
+                                fileDialog.extFilter = {".png", ".bmp", ".tga", ".jpg", ".jpeg", ".gif", ".psd"};
+                                fileDialog.filename[0] = '\0';
+                                fileDialog.error.clear();
+                            }
+                            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Import any image -- resampled to %dx%d", PIC_W[i], PIC_H[i]);
+                        }
+                        else
+                        {
+                            ImGui::Text("%dx%d pixels", pic.w, pic.h);
+                            // Preview: create a temporary SDL texture
+                            static SDL_Texture *picPreviewTex[3] = {};
+                            static int picPreviewW[3] = {}, picPreviewH[3] = {};
+                            if (!picPreviewTex[i] || picPreviewW[i] != pic.w || picPreviewH[i] != pic.h)
+                            {
+                                if (picPreviewTex[i]) SDL_DestroyTexture(picPreviewTex[i]);
+                                picPreviewTex[i] = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32,
+                                                                     SDL_TEXTUREACCESS_STATIC, pic.w, pic.h);
+                                SDL_SetTextureBlendMode(picPreviewTex[i], SDL_BLENDMODE_NONE);
+                                SDL_UpdateTexture(picPreviewTex[i], nullptr, pic.pixels.data(), pic.w * sizeof(Uint32));
+                                picPreviewW[i] = pic.w; picPreviewH[i] = pic.h;
+                            }
+                            float scale = std::min(400.0f / (float)pic.w, 1.0f);
+                            float dw = pic.w * scale, dh = pic.h * scale;
+                            ImGui::Image((ImTextureID)(intptr_t)picPreviewTex[i], ImVec2(dw, dh));
+                            if (ImGui::Button("Import from image..."))
+                            {
+                                assetsEditor.importPicIdx = i;
+                                fileDialog.show = true; fileDialog.saveMode = false;
+                                fileDialog.purpose = DialogPurpose::ImportPicImage;
+                                fileDialog.extFilter = {".png", ".bmp", ".tga", ".jpg", ".jpeg", ".gif", ".psd"};
+                                fileDialog.filename[0] = '\0';
+                                fileDialog.error.clear();
+                            }
+                            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Import any image -- resampled to %dx%d", pic.w, pic.h);
+                            if (ImGui::Button("Export as PNG..."))
+                            {
+                                assetsEditor.exportPicIdx = i;
+                                fileDialog.show = true; fileDialog.saveMode = true;
+                                fileDialog.purpose = DialogPurpose::ExportPicPNG;
+                                fileDialog.extFilter = {".png"};
+                                std::snprintf(fileDialog.filename, sizeof fileDialog.filename, "%s.png",
+                                              PIC_SYMBOLS[i]);
+                                fileDialog.error.clear();
+                            }
+                        }
+                        ImGui::TreePop();
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::Unindent();
+            }
 
             ImGui::End();
         }

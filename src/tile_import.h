@@ -23,7 +23,7 @@
 
 #include "tiles.h" // tile_t
 #include "mapdata.h" // RED[], GREEN[], BLUE[]
-#include "xrick_patch.h" // elf32_find_symbol_file_offset, elf32_patch_symbol
+#include "xrick_patch.h" // find_symbol_file_offset, patch_symbol
 
 #define STBI_NO_STDIO
 #define STB_IMAGE_STATIC
@@ -33,7 +33,7 @@ namespace fs = std::filesystem;
 
 // Lit un fichier entier en memoire. Utilise par tout ce qui charge une
 // image ou un binaire ELF dans ce header (stb_image et
-// elf32_find_symbol_file_offset veulent un buffer en memoire, pas un
+// find_symbol_file_offset veulent un buffer en memoire, pas un
 // chemin -- voir la remarque UTF-8/fs::path plus bas).
 inline bool readWholeFile(const fs::path &path, std::vector<uint8_t> &out, std::string &err)
 {
@@ -260,7 +260,7 @@ inline bool loadTilesFromXrickBinary(const fs::path &path, std::string &err)
     if (buf.empty()) { err = "File is empty or unreadable"; return false; }
 
     size_t off = 0, size = 0;
-    if (!elf32_find_symbol_file_offset(buf, "tiles_data", off, size, err)) return false;
+    if (!find_symbol_file_offset(buf, "tiles_data", off, size, err)) return false;
     size_t expected = sizeof(tiles_data);
     if (size != expected)
     {
@@ -290,7 +290,7 @@ inline bool loadBlocksFromXrickBinary(const fs::path &path, std::string &err)
     if (buf.empty()) { err = "File is empty or unreadable"; return false; }
 
     size_t off = 0, size = 0;
-    if (!elf32_find_symbol_file_offset(buf, "map_blocks", off, size, err)) return false;
+    if (!find_symbol_file_offset(buf, "map_blocks", off, size, err)) return false;
     size_t expected = 0x100 * 16; // block_t = U8[16] in the real engine
     if (size != expected)
     {

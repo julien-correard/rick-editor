@@ -39,7 +39,7 @@
 #include <string>
 #include <algorithm>
 
-#include "xrick_patch.h" // elf32_find_symbol_file_offset, elf32_patch_symbol
+#include "xrick_patch.h" // find_symbol_file_offset, patch_symbol
 
 static const int MAP_NBR_EFLGC = 0x20; // 32: 16 compressed bytes x 2 banks
 
@@ -141,7 +141,7 @@ inline bool loadEflgFromXrickBinary(const fs::path &path, EflgData &out, std::st
     if (buf.empty()) { err = "File is empty or unreadable"; return false; }
 
     size_t off = 0, size = 0;
-    if (!elf32_find_symbol_file_offset(buf, "map_eflg_c", off, size, err)) return false;
+    if (!find_symbol_file_offset(buf, "map_eflg_c", off, size, err)) return false;
     if (size != (size_t)MAP_NBR_EFLGC)
     {
         err = "map_eflg_c has a different size (" + std::to_string(size)
@@ -210,5 +210,5 @@ inline bool repackEflg(const EflgData &data, uint8_t outCompressed32[/*32*/], st
 // bytes. Caller is expected to have already validated with repackEflg().
 inline bool patchEflgSymbol(std::vector<uint8_t> &buf, const uint8_t compressed32[/*32*/], std::string &err)
 {
-    return elf32_patch_symbol(buf, "map_eflg_c", compressed32, MAP_NBR_EFLGC, err);
+    return patch_symbol(buf, "map_eflg_c", compressed32, MAP_NBR_EFLGC, err);
 }
