@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <unordered_map>
 #include <set>
 #include <string>
 #include <vector>
@@ -124,6 +125,15 @@ struct EditorState
     bool pasting = false;      // paste mode: click to place clipboard
     int pasteCol = -1, pasteRow = -1; // cursor position in paste mode
     fs::path currentPath;      // empty if the map was never saved/loaded
+    std::vector<fs::path> recentFiles; // last 3 opened .map files
+
+    void addRecentFile(const fs::path &p)
+    {
+        for (auto it = recentFiles.begin(); it != recentFiles.end(); )
+            it = (*it == p) ? recentFiles.erase(it) : it + 1;
+        recentFiles.insert(recentFiles.begin(), p);
+        if ((int)recentFiles.size() > 3) recentFiles.resize(3);
+    }
 
     // Canvas mode: what a left-click on the map does. Submap = nothing
     // (just look around and inspect screen connections, e.g. to line
@@ -133,7 +143,7 @@ struct EditorState
     // spritePlacementMode) -- shows Sprite Tools. Each of the 3 side
     // windows is scoped to its matching mode, so only one is ever up.
     CanvasMode canvasMode = CanvasMode::Block;
-    bool showGrid = false;         // always-available block-grid overlay (also on above a zoom threshold, see drawMap())
+    bool showGrid = false;         // always-available block-grid overlay
     bool showTriggerBoxes = true;  // show trigger-box overlay for trap entities
 
     // Sprites
@@ -344,12 +354,15 @@ struct FileDialog
     bool show = false;
     bool saveMode = false;
     DialogPurpose purpose = DialogPurpose::OpenMap;
-    fs::path dir = fs::current_path();
+    std::unordered_map<int, fs::path> lastDir; // per-purpose directory memory
     char filename[256] = "";
     std::string error;
     // Empty = show every regular file; otherwise only files whose
     // extension matches one of these (case-sensitive, includes the dot).
     std::vector<std::string> extFilter = {".map"};
+
+    fs::path &currentDir() { return lastDir[(int)purpose]; }
+    void initCurrentDir() { if (!lastDir.count((int)purpose)) lastDir[(int)purpose] = fs::current_path(); }
 };
 
 static void clampCamera(EditorState &st, int viewportW, int viewportH)
@@ -475,7 +488,7 @@ static void drawMap(SDL_Renderer* renderer, SDL_Texture* blockAtlas, const Edito
     // Grid overlay: always on when st.showGrid is set (checkbox / 'g' key
     // in the top bar), or automatically above a zoom level as a visual
     // guide either way.
-    if (st.showGrid || st.cam.zoom >= 3.0f)
+    if (st.showGrid)
     {
         SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
         SDL_SetRenderDrawColor(renderer, 255, 255, 255, 40);
@@ -548,6 +561,7 @@ static void updateWindowTitle(SDL_Window* window, const EditorState &st)
 static bool renderFileDialog(FileDialog &fd, fs::path &outPath)
 {
     if (!fd.show) return false;
+    fd.initCurrentDir();
     const char* title = fd.purpose == DialogPurpose::PickXrickBinary ? "Select xrick binary"
                        : fd.purpose == DialogPurpose::PickXrickBinaryForConnections ? "Select xrick binary"
                        : fd.purpose == DialogPurpose::ImportTileImage ? "Import tile image"
@@ -566,20 +580,20 @@ static bool renderFileDialog(FileDialog &fd, fs::path &outPath)
     bool stillOpen = true;
     if (ImGui::BeginPopupModal(title, &stillOpen, ImGuiWindowFlags_NoSavedSettings))
     {
-        ImGui::TextDisabled("%s", fd.dir.string().c_str());
+        ImGui::TextDisabled("%s", fd.currentDir().string().c_str());
         ImGui::Separator();
 
         if (ImGui::BeginChild("##filelist", ImVec2(0, 300), true))
         {
-            if (fd.dir.has_parent_path() && fd.dir != fd.dir.root_path())
+            if (fd.currentDir().has_parent_path() && fd.currentDir() != fd.currentDir().root_path())
             {
                 if (ImGui::Selectable("[..]"))
-                    fd.dir = fd.dir.parent_path();
+                    fd.currentDir() = fd.currentDir().parent_path();
             }
 
             std::error_code ec;
             std::vector<fs::directory_entry> dirs, files;
-            for (auto &e : fs::directory_iterator(fd.dir, ec))
+            for (auto &e : fs::directory_iterator(fd.currentDir(), ec))
             {
                 if (ec) break;
                 if (e.is_directory()) dirs.push_back(e);
@@ -598,7 +612,7 @@ static bool renderFileDialog(FileDialog &fd, fs::path &outPath)
             {
                 std::string label = "[" + d.path().filename().string() + "]";
                 if (ImGui::Selectable(label.c_str()))
-                    fd.dir = d.path();
+                    fd.currentDir() = d.path();
             }
             for (auto &fentry : files)
             {
@@ -637,7 +651,7 @@ static bool renderFileDialog(FileDialog &fd, fs::path &outPath)
             }
             else
             {
-                fs::path p = fd.dir / name;
+                fs::path p = fd.currentDir() / name;
                 if (fd.saveMode && p.extension() != ".map")
                     p += ".map";
                 if (!fd.saveMode && !fs::exists(p))
@@ -684,7 +698,7 @@ static void doSave(EditorState &st, FileDialog &fd, const ConnectionsData &conn,
 {
     if (st.currentPath.empty()) { requestSaveAs(fd, st.currentPath); return; }
     std::string err;
-    if (saveMapFileWithSprites(st.currentPath, conn, sprites, eflg, texts, err)) st.dirty = false;
+    if (saveMapFileWithSprites(st.currentPath, conn, sprites, eflg, texts, err)) { st.dirty = false; st.addRecentFile(st.currentPath); }
 }
 
 // Rebuilds the tile atlas AND the block atlas for one bank after a tile
@@ -1036,6 +1050,8 @@ int main(int argc, char *argv[])
 
                             st.dirty = true;
                             st.pasting = false;
+                            if (cellValid(col, row))
+                                st.selectedBlock = map_bnums[mapIndex(col, row)];
                         }
                         else
                         {
@@ -1221,6 +1237,34 @@ int main(int argc, char *argv[])
             if (ImGui::BeginMenu("File"))
             {
                 if (ImGui::MenuItem("Open...", "Ctrl+O")) requestOpen(fileDialog);
+                if (!st.recentFiles.empty())
+                {
+                    if (ImGui::BeginMenu("Recent"))
+                    {
+                        for (int i = 0; i < (int)st.recentFiles.size(); i++)
+                        {
+                            std::string label = st.recentFiles[i].filename().string();
+                            if (ImGui::MenuItem(label.c_str()))
+                            {
+                                std::string err;
+                                if (loadMapFileWithSprites(st.recentFiles[i], connections, sprites, eflg, mapTexts, err))
+                                {
+                                    st.currentPath = st.recentFiles[i]; st.dirty = false; st.sel.active = false;
+                                    rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 0);
+                                    rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 1);
+                                    rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 2);
+                                    rebuildSpriteAtlas(renderer, spriteAtlas);
+                                    int vw, vh; SDL_GetRendererOutputSize(renderer, &vw, &vh);
+                                    const MapStartInfo &ms0 = connections.mapStarts[0];
+                                    st.cam.x = (float)ms0.x - vw / (2.0f * st.cam.zoom);
+                                    st.cam.y = (float)((ms0.row + 17) * TILE_PX) - vh / (2.0f * st.cam.zoom);
+                                    st.addRecentFile(st.currentPath);
+                                }
+                            }
+                        }
+                        ImGui::EndMenu();
+                    }
+                }
                 if (ImGui::MenuItem("Save", "Ctrl+S")) doSave(st, fileDialog, connections, sprites, eflg, mapTexts);
                 if (ImGui::MenuItem("Save As...")) requestSaveAs(fileDialog, st.currentPath);
                 ImGui::Separator();
@@ -1233,7 +1277,7 @@ int main(int argc, char *argv[])
                     fileDialog.filename[0] = '\0';
                     fileDialog.error.clear();
                 }
-                if (ImGui::MenuItem("Import connections, sprites, tile hazards, tile graphics, blocks, sprite graphics && intro text from xrick binary..."))
+                if (ImGui::MenuItem("Import from xrick binary..."))
                 {
                     fileDialog.show = true;
                     fileDialog.saveMode = false;
@@ -1407,10 +1451,12 @@ int main(int argc, char *argv[])
                 screenToCell(st, (float)mx, (float)my, col, row);
                 int tileCol = std::clamp(screenToTileCol(st, (float)mx), 0, 31);
                 int tileRow = screenToTileRow(st, (float)my);
+                int topTileRow = (int)std::floor(st.cam.y / TILE_PX);
+                int curSubmap = submapForAbsRow(connections, topTileRow);
                 if (cellValid(col, row))
-                    ImGui::Text("col %d, row %d (index %d) -- tile col %d, tile row %d", col, row, mapIndex(col, row), tileCol, tileRow);
+                    ImGui::Text("col %d, row %d (index %d) -- tile col %d, tile row %d -- submap %d", col, row, mapIndex(col, row), tileCol, tileRow, curSubmap);
                 else
-                    ImGui::Text("out of map -- tile col %d, tile row %d", tileCol, tileRow);
+                    ImGui::Text("out of map -- tile col %d, tile row %d -- submap %d", tileCol, tileRow, curSubmap);
             }
 
             toolbarH = ImGui::GetWindowHeight();
@@ -1436,13 +1482,14 @@ int main(int argc, char *argv[])
             switch (fileDialog.purpose)
             {
                 case DialogPurpose::SaveMap:
-                    if (saveMapFileWithSprites(chosenPath, connections, sprites, eflg, mapTexts, err)) { st.currentPath = chosenPath; st.dirty = false; }
+                    if (saveMapFileWithSprites(chosenPath, connections, sprites, eflg, mapTexts, err)) { st.currentPath = chosenPath; st.dirty = false; st.addRecentFile(chosenPath); }
                     else fileDialog.error = err;
                     break;
                 case DialogPurpose::OpenMap:
                     if (loadMapFileWithSprites(chosenPath, connections, sprites, eflg, mapTexts, err))
                     {
                         st.currentPath = chosenPath; st.dirty = false; st.sel.active = false;
+                        st.addRecentFile(chosenPath);
                         rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 0);
                         rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 1);
                         rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 2);
@@ -2333,6 +2380,8 @@ int main(int argc, char *argv[])
                                 rebuildBlockAtlasOnly(renderer, tileAtlas, blockAtlas, 2);
                                 st.dirty = true;
                             }
+                            blockEditor.selectedBlock = b;
+                            blockEditor.selectedCell = 0;
                             blockEditor.copyMode = false;
                         }
                         else

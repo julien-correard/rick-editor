@@ -341,7 +341,7 @@ inline bool pe32_find_symbol_file_offset(const std::vector<uint8_t> &buf,
         err = "Not a PE32 file"; return false;
     }
 
-    // Parse PE header to find .data section bounds
+    // Parse PE header
     uint32_t peOff = *reinterpret_cast<const uint32_t*>(buf.data() + 0x3C);
     if (peOff + 24 > buf.size() || buf[peOff] != 'P' || buf[peOff+1] != 'E')
     {
@@ -351,24 +351,123 @@ inline bool pe32_find_symbol_file_offset(const std::vector<uint8_t> &buf,
     uint16_t optHeaderSize = *reinterpret_cast<const uint16_t*>(buf.data() + peOff + 20);
     size_t sectionTableOff = peOff + 24 + optHeaderSize;
 
+    // Parse all section headers (needed for both COFF and pattern paths)
+    struct PESection { uint32_t vSize, vAddr, rawSize, rawPtr; };
+    std::vector<PESection> sections(numSections);
     size_t dataStart = 0, dataSize = 0;
     for (int i = 0; i < numSections; i++)
     {
         size_t sh = sectionTableOff + (size_t)i * 40;
         if (sh + 40 > buf.size()) break;
+        sections[i].vSize  = *reinterpret_cast<const uint32_t*>(buf.data() + sh + 8);
+        sections[i].vAddr  = *reinterpret_cast<const uint32_t*>(buf.data() + sh + 12);
+        sections[i].rawSize = *reinterpret_cast<const uint32_t*>(buf.data() + sh + 16);
+        sections[i].rawPtr = *reinterpret_cast<const uint32_t*>(buf.data() + sh + 20);
         if (std::memcmp(buf.data() + sh, ".data", 5) == 0)
         {
-            dataStart = *reinterpret_cast<const uint32_t*>(buf.data() + sh + 20);
-            dataSize = *reinterpret_cast<const uint32_t*>(buf.data() + sh + 16);
-            break;
+            dataStart = sections[i].rawPtr;
+            dataSize = sections[i].rawSize;
         }
     }
+
+    // --- Pass 1: COFF symbol table (works for debug/dev builds with symbols) ---
+    uint32_t coffSymOff = *reinterpret_cast<const uint32_t*>(buf.data() + peOff + 12);
+    uint32_t coffSymCount = *reinterpret_cast<const uint32_t*>(buf.data() + peOff + 16);
+    if (coffSymOff && coffSymCount && coffSymOff + (size_t)coffSymCount * 18 <= buf.size())
+    {
+        size_t strTabOff = coffSymOff + (size_t)coffSymCount * 18;
+
+        // Known symbol sizes (from original pattern table / verified against binary layout)
+        static const struct { const char *name; size_t size; } knownSizes[] = {
+            { "map_bnums",              0x1fd8 },
+            { "map_connect",            0x264  },
+            { "map_submaps",            0x178  },
+            { "map_eflg_c",             0x20   },
+            { "map_marks",              0xa37  },
+            { "map_maps",               0x3c   },
+            { "tiles_data",             0x6000 },
+            { "map_blocks",             0x1000 },
+            { "sprites_data",           0x11790 },
+            { "screen_imaptext_amazon", 0x139  },
+            { "screen_imaptext_egypt",  0x11a  },
+            { "screen_imaptext_castle", 0x11a  },
+            { "screen_imaptext_missile",0xfb   },
+            { "screen_imaptext_muchlater", 0x11a },
+            { "pic_congrats",           0x1480 },
+            { "pic_haf",                0x1400 },
+            { "pic_splash",             0x8000 },
+            { "screen_imaincdc",        0x60   },
+            { "screen_gameovertxt",     0x40   },
+            { "screen_pausedtxt",       0x40   },
+        };
+
+        for (uint32_t i = 0; i < coffSymCount; )
+        {
+            const uint8_t *sym = buf.data() + coffSymOff + (size_t)i * 18;
+            uint16_t sectionNum = *reinterpret_cast<const uint16_t*>(sym + 12);
+            uint32_t value = *reinterpret_cast<const uint32_t*>(sym + 8);
+            uint8_t storageClass = sym[16];
+            uint8_t numAux = sym[17];
+
+            // Resolve symbol name (8-byte inline or string table ref)
+            std::string name;
+            if (sym[0] == 0 && sym[1] == 0 && sym[2] == 0 && sym[3] == 0)
+            {
+                uint32_t strOff = *reinterpret_cast<const uint32_t*>(sym + 4);
+                if (strTabOff + strOff < buf.size())
+                    name = reinterpret_cast<const char*>(buf.data() + strTabOff + strOff);
+            }
+            else
+            {
+                // Inline name: up to 8 chars, NUL-terminated if < 8
+                char inlineName[9];
+                std::memcpy(inlineName, sym, 8);
+                inlineName[8] = '\0';
+                name = inlineName;
+            }
+
+            i += 1 + numAux; // skip aux records
+
+            if (name.empty() || storageClass == 0) continue;
+
+            // Strip leading underscore (MinGW convention)
+            std::string stripped = (name.size() > 1 && name[0] == '_') ? name.substr(1) : name;
+
+            if (stripped != symbolName) continue;
+
+            // Skip absolute/undefined symbols
+            if (sectionNum <= 0 || sectionNum > (int)numSections) continue;
+
+            const PESection &sec = sections[sectionNum - 1];
+            // value is a section-relative offset in COFF
+            size_t symFileOff = (size_t)value + sec.rawPtr;
+
+            if (symFileOff >= buf.size()) continue;
+
+            // Look up known size
+            size_t size = 0;
+            for (auto &ks : knownSizes)
+                if (std::strcmp(ks.name, symbolName) == 0) { size = ks.size; break; }
+
+            if (size == 0)
+            {
+                // Unknown size: use section boundary or rest of file
+                size_t sectionEnd = sec.rawPtr + sec.rawSize;
+                size = (symFileOff < sectionEnd) ? sectionEnd - symFileOff : buf.size() - symFileOff;
+            }
+
+            fileOffset = symFileOff;
+            symSize = size;
+            return true;
+        }
+    }
+
+    // --- Pass 2: pattern scanning (original stripped Windows xrick.exe) ---
     if (dataStart == 0 || dataSize == 0)
     {
         err = "No .data section found in PE32 binary"; return false;
     }
 
-    // Search the pattern table
     for (const auto &entry : pe32_patterns)
     {
         if (std::strcmp(entry.name, symbolName) != 0) continue;
