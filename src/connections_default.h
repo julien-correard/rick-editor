@@ -750,13 +750,12 @@ static const std::array<MarkRaw, 523> defaultMarksRaw = {{
 // Stock per-map start positions (map_maps), from dat_maps.c.
 // {x, y, row, submap} -- tune strings omitted (they are pointer-based
 // in the ELF and not something the editor patches).
-static const int MAP_NBR_MAPS = 5;
+static const int MAP_NBR_MAPS = 4;
 static const std::array<MapStartRaw, MAP_NBR_MAPS> defaultMapStartsRaw = {{
-  {0x0008, 0x008b, 0x0008, 0x0000}, // map 0: tune0
-  {0x0008, 0x008b, 0x0068, 0x0009}, // map 1: tune1
-  {0x0010, 0x008b, 0x0010, 0x0014}, // map 2: tune2
-  {0x0010, 0x008b, 0x0010, 0x0026}, // map 3: tune3
-  {0x0074, 0x00c8, 0x0008, 0x0026}, // map 4: tune4
+  {0x0008, 0x008b, 0x0008, 0x0000}, // map 1: tune0
+  {0x0008, 0x008b, 0x0068, 0x0009}, // map 2: tune1
+  {0x0010, 0x008b, 0x0010, 0x0014}, // map 3: tune2
+  {0x0010, 0x008b, 0x0010, 0x0026}, // map 4: tune3
 }};
 
 // Entity type -> sprite/step art data, from the real xrick source's
@@ -828,11 +827,11 @@ static const std::array<EntData, 74> entDataTable = {{
   {18, 21, 60, 103}, // ent 50
   {18, 21, 65, 106}, // ent 51
   {24, 21, 102, 108}, // ent 52
-  {24, 21, 70, 113}, // ent 53
-  {18, 16, 75, 116}, // ent 54
-  {18, 16, 79, 116}, // ent 55
-  {24, 21, 83, 118}, // ent 56
-  {16, 8, 87, 7}, // ent 57
+  {24, 21, 109, 113}, // ent 53 (dog, spr_slept=0x6d)
+  {18, 16, 113, 116}, // ent 54 (door top, spr_slept=0x71)
+  {18, 16, 114, 116}, // ent 55 (door bottom, spr_slept=0x72)
+  {24, 21, 115, 118}, // ent 56 (soldier who shoots, sprbase 83 -> sprite 115)
+  {16, 8, 0, 7}, // ent 57 (trap fires bullets, sprbase 87 -> sprite 0)
   {24, 16, 90, 126}, // ent 58
   {24, 16, 92, 9}, // ent 59
   {24, 17, 104, 136}, // ent 60
@@ -841,7 +840,7 @@ static const std::array<EntData, 74> entDataTable = {{
   {32, 8, 117, 144}, // ent 63
   {24, 16, 109, 9}, // ent 64
   {24, 21, 119, 18}, // ent 65
-  {24, 21, 70, 146}, // ent 66
+  {24, 21, 109, 146}, // ent 66 (dog, spr_slept=0x6d)
   {24, 21, 128, 148}, // ent 67
   {24, 21, 128, 191}, // ent 68
   {24, 17, 104, 229}, // ent 69

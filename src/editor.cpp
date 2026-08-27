@@ -164,11 +164,14 @@ struct TileEditorState
     bool open = false;
     int bank = 1;          // FIRST_USABLE_BANK..LAST_USABLE_BANK, same convention as st.bank
     int selectedTile = -1; // -1 = nothing selected yet
+    std::set<int> multiSelected; // Ctrl+click / Shift+click multi-selection
+    int anchorTile = -1; // anchor for Shift+click range select
     int batchStartTile = 0; // "Batch import..." starting tile index
     bool swapMode = false; // "Swap with..." armed -- next tile clicked swaps with selectedTile
                     bool copyMode = false; // "Copy to..." armed -- next tile clicked gets the copied tile
     tile_t copiedTile{};
     bool hasCopiedTile = false;
+    bool confirmDelete = false; // true while delete confirmation popup is open
 };
 
 struct PixelEditorState
@@ -220,6 +223,11 @@ static void entTriggerSize(int ent, int &tw, int &th)
     case 45: tw = 20; th = 4; return;  // wide grille
     case 49: tw =  4; th = 4; return;  // narrow grille
     case 52: tw =  4; th = 4; return;  // rising grille
+    case 53: tw =  4; th = 4; return;  // dog, walks left slowly
+    case 54: tw =  4; th = 4; return;  // door top
+    case 55: tw =  4; th = 4; return;  // door bottom
+    case 57: tw = 16; th = 4; return;  // trap fires bullets, wide trigger zone
+    case 66: tw = 31; th = 4; return;  // dog, walks left, wide trigger zone
     case 72: tw =  4; th = 4; return;  // stone block, slides right
     default: tw = 0;  th = 0; return;
     }
@@ -293,6 +301,42 @@ static const char *entInfoText(int ent)
                "When triggered by dynamite or proximity,\n"
                "slides right ~560 px then loops.\n"
                "Use dynamite to clear the way.";
+    // --- Doors (type-3, pairs that block and vanish on bomb) ---
+    case 54:
+        return "Door -- top piece (18x16).\n"
+               "Paired with entity 55 (bottom piece, STOPRICK).\n"
+               "Both start asleep and invisible to Rick.\n"
+               "Triggered ONLY by bombs (TRIGBOMB).\n"
+               "On trigger: plays sound, vanishes for 8 ticks,\n"
+               "then permanently deactivates (ENT_FLG_ONCE).";
+    case 55:
+        return "Door -- bottom piece (18x16).\n"
+               "Paired with entity 54 (top piece).\n"
+               "Blocks Rick's path (STOPRICK flag).\n"
+               "Triggered ONLY by bombs (TRIGBOMB).\n"
+               "On trigger: becomes LETHAL to Rick for 8 ticks,\n"
+               "then permanently deactivates (ENT_FLG_ONCE).";
+    // --- Shooting soldier (type-3, stationary) ---
+    case 56:
+        return "Soldier who shoots (24x21).\n"
+               "Stands still and fires projectiles.\n"
+               "Trigger box = 4x4 tiles.\n"
+               "3 entity slots shared for projectiles.";
+    // --- Bullet trap (type-3, fires left) ---
+    case 57:
+        return "Bullet trap (16x8). Fires projectiles LEFT.\n"
+               "Trigger zone = 16x4 tiles (wide, flat).\n"
+               "Projectile travels left for ~70 frames then stops.\n"
+               "3 entity slots shared for projectiles.";
+    // --- Dog (type-3, walks along ground) ---
+    case 53:
+        return "Dog (24x21). Walks left slowly at 2 px/frame.\n"
+               "Trigger box = 4x4 tiles.\n"
+               "Default flags: ONCE + TRIGRICK + LETHALI.";
+    case 66:
+        return "Dog (24x21). Walks left at 6 px/frame.\n"
+               "Trigger box = 31x4 tiles (wide detection zone).\n"
+               "Default flags: ONCE + TRIGRICK + LETHALI.";
     // --- Special ---
     case 32:
         return "Arrow trap. Fires vertically.\n"
@@ -364,6 +408,57 @@ struct FileDialog
     fs::path &currentDir() { return lastDir[(int)purpose]; }
     void initCurrentDir() { if (!lastDir.count((int)purpose)) lastDir[(int)purpose] = fs::current_path(); }
 };
+
+static fs::path configPath()
+{
+    const char *home = std::getenv("HOME");
+    if (!home) return {};
+    return fs::path(home) / ".config" / "rickeditor" / "config.txt";
+}
+
+static void saveConfig(const EditorState &st, const FileDialog &fd)
+{
+    auto p = configPath();
+    if (p.empty()) return;
+    std::error_code ec;
+    fs::create_directories(p.parent_path(), ec);
+    FILE *f = std::fopen(p.string().c_str(), "w");
+    if (!f) return;
+    for (auto &rf : st.recentFiles)
+        std::fprintf(f, "recent=%s\n", rf.string().c_str());
+    for (auto &[purpose, dir] : fd.lastDir)
+        std::fprintf(f, "dir:%d=%s\n", purpose, dir.string().c_str());
+    std::fclose(f);
+}
+
+static void loadConfig(EditorState &st, FileDialog &fd)
+{
+    auto p = configPath();
+    if (!fs::exists(p)) return;
+    FILE *f = std::fopen(p.string().c_str(), "r");
+    if (!f) return;
+    char line[1024];
+    while (std::fgets(line, sizeof(line), f))
+    {
+        // strip trailing newline
+        line[strcspn(line, "\r\n")] = '\0';
+        if (std::strncmp(line, "recent=", 7) == 0)
+        {
+            fs::path rp(line + 7);
+            if (fs::exists(rp)) st.addRecentFile(rp);
+        }
+        else if (std::strncmp(line, "dir:", 4) == 0)
+        {
+            const char *eq = std::strchr(line + 4, '=');
+            if (eq)
+            {
+                int purpose = std::atoi(line + 4);
+                fd.lastDir[purpose] = fs::path(eq + 1);
+            }
+        }
+    }
+    std::fclose(f);
+}
 
 static void clampCamera(EditorState &st, int viewportW, int viewportH)
 {
@@ -558,7 +653,7 @@ static void updateWindowTitle(SDL_Window* window, const EditorState &st)
 
 // Renders the Open/Save As modal. Returns true the frame the user
 // confirms a path (placed in outPath).
-static bool renderFileDialog(FileDialog &fd, fs::path &outPath)
+static bool renderFileDialog(FileDialog &fd, fs::path &outPath, const EditorState &st)
 {
     if (!fd.show) return false;
     fd.initCurrentDir();
@@ -588,7 +683,10 @@ static bool renderFileDialog(FileDialog &fd, fs::path &outPath)
             if (fd.currentDir().has_parent_path() && fd.currentDir() != fd.currentDir().root_path())
             {
                 if (ImGui::Selectable("[..]"))
+                {
                     fd.currentDir() = fd.currentDir().parent_path();
+                    saveConfig(st, fd);
+                }
             }
 
             std::error_code ec;
@@ -612,7 +710,10 @@ static bool renderFileDialog(FileDialog &fd, fs::path &outPath)
             {
                 std::string label = "[" + d.path().filename().string() + "]";
                 if (ImGui::Selectable(label.c_str()))
+                {
                     fd.currentDir() = d.path();
+                    saveConfig(st, fd);
+                }
             }
             for (auto &fentry : files)
             {
@@ -698,7 +799,7 @@ static void doSave(EditorState &st, FileDialog &fd, const ConnectionsData &conn,
 {
     if (st.currentPath.empty()) { requestSaveAs(fd, st.currentPath); return; }
     std::string err;
-    if (saveMapFileWithSprites(st.currentPath, conn, sprites, eflg, texts, err)) { st.dirty = false; st.addRecentFile(st.currentPath); }
+    if (saveMapFileWithSprites(st.currentPath, conn, sprites, eflg, texts, err)) { st.dirty = false; st.addRecentFile(st.currentPath); saveConfig(st, fd); }
 }
 
 // Rebuilds the tile atlas AND the block atlas for one bank after a tile
@@ -867,6 +968,7 @@ int main(int argc, char *argv[])
     TextEditorState textEditor;
     FileDialog fileDialog;
     ConnectionsData connections = defaultConnections();
+    loadConfig(st, fileDialog);
     MarksData sprites = defaultMarks();
     EflgData eflg = defaultEflg();
     std::array<ImapText, SCREEN_IMAPTEXT_COUNT> mapTexts = defaultImapTexts();
@@ -985,6 +1087,8 @@ int main(int argc, char *argv[])
                                     defaultFlags |= ENT_FLG_LETHALI;
                                 if (st.selectedEnt == 25 || st.selectedEnt == 26 || st.selectedEnt == 32)
                                     defaultFlags |= ENT_FLG_LETHALI;
+                                if (st.selectedEnt == 53 || st.selectedEnt == 66)
+                                    defaultFlags |= ENT_FLG_ONCE | ENT_FLG_LETHALI;
                                 sprites.marks[owner].push_back(MarkEntry{snappedRow, tileCol, fineY, st.selectedEnt, defaultFlags, tileCol, 0});
                                 st.dirty = true;
                             }
@@ -1259,6 +1363,7 @@ int main(int argc, char *argv[])
                                     st.cam.x = (float)ms0.x - vw / (2.0f * st.cam.zoom);
                                     st.cam.y = (float)((ms0.row + 17) * TILE_PX) - vh / (2.0f * st.cam.zoom);
                                     st.addRecentFile(st.currentPath);
+                                    saveConfig(st, fileDialog);
                                 }
                             }
                         }
@@ -1405,6 +1510,16 @@ int main(int argc, char *argv[])
             wrap();
 
             divider();
+            ImGui::TextDisabled("Bank");
+            for (int b = FIRST_USABLE_BANK; b <= LAST_USABLE_BANK; b++)
+            {
+                ImGui::SameLine();
+                char label[16]; std::snprintf(label, sizeof label, "%d##tb", b);
+                if (ImGui::RadioButton(label, st.bank == b)) st.bank = b;
+            }
+            wrap();
+
+            divider();
             for (int i = 0; i < 4; i++)
             {
                 ImGui::PushID(9000 + i);
@@ -1440,7 +1555,7 @@ int main(int argc, char *argv[])
             if (st.placeStartMode >= 0)
             {
                 divider();
-                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1), "Placing Map %d start: click on map, Esc to cancel", st.placeStartMode);
+                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1), "Placing Map %d start: click on map, Esc to cancel", st.placeStartMode + 1);
                 wrap();
             }
 
@@ -1476,13 +1591,13 @@ int main(int argc, char *argv[])
         const ImGuiWindowFlags toolPanelFlags = ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse;
 
         fs::path chosenPath;
-        if (renderFileDialog(fileDialog, chosenPath))
+        if (renderFileDialog(fileDialog, chosenPath, st))
         {
             std::string err;
             switch (fileDialog.purpose)
             {
                 case DialogPurpose::SaveMap:
-                    if (saveMapFileWithSprites(chosenPath, connections, sprites, eflg, mapTexts, err)) { st.currentPath = chosenPath; st.dirty = false; st.addRecentFile(chosenPath); }
+                    if (saveMapFileWithSprites(chosenPath, connections, sprites, eflg, mapTexts, err)) { st.currentPath = chosenPath; st.dirty = false; st.addRecentFile(chosenPath); saveConfig(st, fileDialog); }
                     else fileDialog.error = err;
                     break;
                 case DialogPurpose::OpenMap:
@@ -1490,6 +1605,7 @@ int main(int argc, char *argv[])
                     {
                         st.currentPath = chosenPath; st.dirty = false; st.sel.active = false;
                         st.addRecentFile(chosenPath);
+                        saveConfig(st, fileDialog);
                         rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 0);
                         rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 1);
                         rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 2);
@@ -1800,15 +1916,6 @@ int main(int argc, char *argv[])
             ImGui::SetNextWindowPos(toolPanelPos);
             ImGui::SetNextWindowSize(toolPanelSize);
             ImGui::Begin("Block Palette", nullptr, toolPanelFlags);
-            ImGui::Text("Tile bank:");
-            ImGui::SameLine();
-            for (int b = FIRST_USABLE_BANK; b <= LAST_USABLE_BANK; b++)
-            {
-                if (b > FIRST_USABLE_BANK) ImGui::SameLine();
-                char label[16]; std::snprintf(label, sizeof label, "%d##bank", b);
-                if (ImGui::RadioButton(label, st.bank == b)) st.bank = b;
-            }
-            ImGui::Separator();
             ImGui::Text("Selected block: %d", st.selectedBlock);
             ImGui::Separator();
 
@@ -1980,12 +2087,15 @@ int main(int argc, char *argv[])
                     float v1 = v0 + 1.0f / ATLAS_TILES_PER_ROW;
 
                     bool selected = (t == tileEditor.selectedTile);
+                    bool multiSel = tileEditor.multiSelected.count(t) > 0;
                     bool stylePushed = false;
                     if (selected) { ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.55f, 0.95f, 1.0f)); stylePushed = true; }
+                    else if (multiSel) { ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.60f, 0.35f, 0.70f, 1.0f)); stylePushed = true; }
                     else if (tileEditor.swapMode) { ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.45f, 0.10f, 1.0f)); stylePushed = true; }
                     else if (tileEditor.copyMode) { ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.45f, 0.65f, 0.30f, 1.0f)); stylePushed = true; }
                     if (ImGui::ImageButton("##tile", tileTexId, ImVec2(thumb, thumb), ImVec2(u0, v0), ImVec2(u1, v1)))
                     {
+                        ImGuiIO &io = ImGui::GetIO();
                         if (tileEditor.swapMode && tileEditor.selectedTile >= 0 && t != tileEditor.selectedTile)
                         {
                             int a = tileEditor.selectedTile, b = t;
@@ -2021,10 +2131,32 @@ int main(int argc, char *argv[])
                             tileEditor.copyMode = false;
                             tileEditor.selectedTile = t;
                         }
+                        else if (io.KeyShift && tileEditor.anchorTile >= 0)
+                        {
+                            // Shift+click: range select from anchor to clicked tile
+                            int a = tileEditor.anchorTile;
+                            int lo = std::min(a, t), hi = std::max(a, t);
+                            tileEditor.multiSelected.clear();
+                            for (int i = lo; i <= hi; i++)
+                                tileEditor.multiSelected.insert(i);
+                            tileEditor.selectedTile = t;
+                        }
+                        else if (io.KeyCtrl)
+                        {
+                            // Ctrl+click: toggle multi-selection
+                            auto it = tileEditor.multiSelected.find(t);
+                            if (it != tileEditor.multiSelected.end())
+                                tileEditor.multiSelected.erase(it);
+                            else
+                                tileEditor.multiSelected.insert(t);
+                            tileEditor.anchorTile = t;
+                        }
                         else
                         {
                             tileEditor.selectedTile = t;
                             tileEditor.batchStartTile = t;
+                            tileEditor.multiSelected.clear();
+                            tileEditor.anchorTile = t;
                         }
                     }
                     if (stylePushed) ImGui::PopStyleColor();
@@ -2041,7 +2173,49 @@ int main(int argc, char *argv[])
             ImGui::SameLine();
             ImGui::BeginChild("##tileDetail", ImVec2(detailW, 0));
             {
-                if (tileEditor.selectedTile < 0)
+                if (!tileEditor.multiSelected.empty())
+                {
+                    ImGui::Text("%d tiles selected (bank %d)", (int)tileEditor.multiSelected.size(), tileEditor.bank);
+                    ImGui::Spacing();
+                    if (ImGui::SmallButton("Clear selection"))
+                        tileEditor.multiSelected.clear();
+                    ImGui::Spacing();
+                    if (ImGui::SmallButton("Delete selected"))
+                        tileEditor.confirmDelete = true;
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Clear all pixels of %d selected tiles (cannot be undone)", (int)tileEditor.multiSelected.size());
+                    if (tileEditor.confirmDelete)
+                    {
+                        ImGui::OpenPopup("Delete tiles?");
+                        ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+                        ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+                        if (ImGui::BeginPopupModal("Delete tiles?", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+                        {
+                            ImGui::Text("This will clear all pixels of %d tiles in bank %d.\nThis cannot be undone.",
+                                        (int)tileEditor.multiSelected.size(), tileEditor.bank);
+                            ImGui::Separator();
+                            if (ImGui::Button("Delete", ImVec2(120, 0)))
+                            {
+                                for (int t : tileEditor.multiSelected)
+                                    for (int y = 0; y < 8; y++)
+                                        tiles_data[tileEditor.bank][t][y] = 0;
+                                rebuildBankAtlases(renderer, tileAtlas, blockAtlas, tileEditor.bank);
+                                st.dirty = true;
+                                tileEditor.multiSelected.clear();
+                                tileEditor.selectedTile = -1;
+                                tileEditor.confirmDelete = false;
+                                ImGui::CloseCurrentPopup();
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::Button("Cancel", ImVec2(120, 0)))
+                            {
+                                tileEditor.confirmDelete = false;
+                                ImGui::CloseCurrentPopup();
+                            }
+                            ImGui::EndPopup();
+                        }
+                    }
+                }
+                else if (tileEditor.selectedTile < 0)
                 {
                     ImGui::TextWrapped("Click a tile on the left to select it.");
                 }
@@ -3053,14 +3227,14 @@ int main(int argc, char *argv[])
             if (ImGui::CollapsingHeader("Map Start Positions"))
             {
                 ImGui::Indent();
-                ImGui::TextWrapped("Each of the 5 maps (levels) has a start position that controls "
+                ImGui::TextWrapped("Each of the 4 maps (levels) has a start position that controls "
                                    "where Rick appears initially: pixel coordinates (x, y), the "
                                    "first displayed tile-row in game, and the starting submap "
                                    "index. Rick's actual screen row depends on both the scroll "
                                    "position and his pixel Y offset. These values come from "
                                    "xrick's map_maps[] array (dat_maps.c).");
                 ImGui::Separator();
-                static const char *mapNames[] = {"Map 0", "Map 1", "Map 2", "Map 3", "Map 4"};
+                static const char *mapNames[] = {"Map 1", "Map 2", "Map 3", "Map 4"};
                 for (int m = 0; m < MAP_NBR_MAPS; m++)
                 {
                     ImGui::PushID(2000 + m);
@@ -3195,9 +3369,9 @@ int main(int argc, char *argv[])
                             ImGui::TextDisabled("No sprites or exits placed in it yet.");
                     }
 
-                    int bank = connections.submaps[s].page == 1 ? 2 : 1;
+                    int bank = connections.submaps[s].page; // 0 = tile bank 1, 1 = tile bank 2
                     ImGui::SetNextItemWidth(90);
-                    if (ImGui::Combo("Tile bank", &bank, "1\0002\0\0")) connections.submaps[s].page = (bank == 2) ? 1 : 0;
+                    if (ImGui::Combo("Tile bank", &bank, "1\0002\0\0")) connections.submaps[s].page = bank;
                     ImGui::SameLine();
                     if (ImGui::SmallButton("Delete submap"))
                         ImGui::OpenPopup("confirm_delete_submap");
@@ -3307,7 +3481,7 @@ int main(int argc, char *argv[])
             // Quick-pick chips for all entity types that have a valid sprite.
             std::vector<int> all;
             for (int e = 0; e < (int)entDataTable.size(); e++)
-                if (entDataTable[e].spr > 0 && entDataTable[e].spr < SPRITES_NBR_SPRITES)
+                if (entDataTable[e].h > 0 && entDataTable[e].spr < SPRITES_NBR_SPRITES)
                     all.push_back(e);
             // Mark which ones are already used on the map.
             std::set<int> used;
