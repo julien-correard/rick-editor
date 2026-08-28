@@ -213,22 +213,59 @@ static void entTriggerSize(int ent, int &tw, int &th)
 {
     switch (ent)
     {
+    case 22: tw =  4; th = 4; return;  // special bonus
+    case 23: tw =  4; th = 4; return;  // special bonus
+    case 24: tw =  3; th = 3; return;  // ticking bomb
     case 25: tw =  4; th = 4; return;  // arrow trap
     case 26: tw = 16; th = 4; return;  // arrow trap, wide trigger
     case 27: tw =  4; th = 4; return;  // wall spike trap
+    case 28: tw =  4; th = 4; return;  // slow left trap
+    case 29: tw =  4; th = 4; return;  // bomb-like
+    case 30: tw =  4; th = 4; return;  // bomb-like
+    case 31: tw =  4; th = 4; return;  // rising/falling trap
     case 32: tw =  4; th = 7; return;  // arrow trap, vertical
+    case 33: tw = 20; th = 4; return;  // wide trap
+    case 34: tw =  4; th = 4; return;  // small trap
+    case 35: tw =  4; th = 4; return;  // small trap
+    case 36: tw =  3; th = 3; return;  // ticking bomb
+    case 37: tw =  4; th = 4; return;  // wall crusher
+    case 38: tw =  4; th = 4; return;  // grille trap
     case 39: tw =  4; th = 4; return;  // spike trap
+    case 40: tw =  4; th = 4; return;  // spike wall
+    case 41: tw =  4; th = 4; return;  // spike wall
+    case 42: tw =  4; th = 4; return;  // spike wall
+    case 43: tw =  4; th = 4; return;  // stone block, complex path
     case 44: tw =  4; th = 4; return;  // stone block, slides left
-    case 48: tw =  4; th = 4; return;  // stone block, complex path
     case 45: tw = 20; th = 4; return;  // wide grille
+    case 46: tw =  3; th = 3; return;  // bomb-like
+    case 47: tw =  4; th = 4; return;  // bomb-like
+    case 48: tw =  4; th = 4; return;  // stone block, complex path
     case 49: tw =  4; th = 4; return;  // narrow grille
+    case 50: tw =  4; th = 4; return;  // small trap
+    case 51: tw = 24; th = 4; return;  // wide trap
     case 52: tw =  4; th = 4; return;  // rising grille
     case 53: tw =  4; th = 4; return;  // dog, walks left slowly
     case 54: tw =  4; th = 4; return;  // door top
     case 55: tw =  4; th = 4; return;  // door bottom
+    case 56: tw =  4; th = 4; return;  // shooting soldier
     case 57: tw = 16; th = 4; return;  // trap fires bullets, wide trigger zone
+    case 58: tw =  4; th = 4; return;  // small trap
+    case 59: tw =  3; th = 3; return;  // bomb-like
+    case 60: tw =  4; th = 4; return;  // small trap
+    case 61: tw = 24; th = 4; return;  // wide trap
+    case 62: tw =  4; th = 4; return;  // bomb-like
+    case 63: tw = 20; th = 4; return;  // fast projectile
+    case 64: tw =  3; th = 3; return;  // bomb-like
+    case 65: tw =  4; th = 6; return;  // spitter
     case 66: tw = 31; th = 4; return;  // dog, walks left, wide trigger zone
+    case 67: tw =  4; th = 4; return;  // teleport
+    case 68: tw =  4; th = 4; return;  // teleport
+    case 69: tw =  4; th = 4; return;  // small trap
+    case 70: tw =  4; th = 4; return;  // small trap
+    case 71: tw = 24; th = 4; return;  // wide trap
     case 72: tw =  4; th = 4; return;  // stone block, slides right
+    case 73: tw =  4; th = 4; return;  // slow right trap
+    case 16: case 17: case 18: case 19: case 21:
     default: tw = 0;  th = 0; return;
     }
 }
@@ -263,17 +300,31 @@ static const char *entInfoText(int ent)
     case 6: case 9: case 12: case 15:
         return "Climber (type 2). Climbs walls toward Rick.\n"
                "3 walker/climber slots shared globally.";
-    // --- Type-3 traps (id >= 0x18) ---
+    // --- Type-3 fireball traps ---
     case 29:
-        return "Type-3 entity. Starts asleep, wakes on trigger.\n"
-               "Movement sequence defined in ent_mvstep.";
+        return "Fireball trap (24x21). Fires a fireball LEFT.\n"
+               "Projectile then arcs with a bouncing trajectory.\n"
+               "Sprite = 88 (fireball). Trigger box = 4x4 tiles.";
     case 30:
-        return "Type-3 entity. Starts asleep, wakes on trigger.\n"
-               "Movement sequence defined in ent_mvstep.";
+        return "Fireball trap (24x21). Fires a fireball RIGHT.\n"
+               "Projectile then arcs with a bouncing trajectory.\n"
+               "Sprite = 88 (fireball). Trigger box = 4x4 tiles.";
     // --- Boxes / bonuses (type 0, ids 16-23) ---
-    case 16: case 17: case 18: case 19:
-    case 20: case 21: case 22: case 23:
-        return "Box / bonus item. Static, picked up on contact.";
+    case 16:
+        return "Ammo box. Refills Rick's bullets to max\n"
+               "(GAME_BULLETS_INIT, 34 total) on pickup.\n"
+               "Can also be blown up by bomb/bullet/stick.";
+    case 17:
+        return "Dynamite crate. Refills Rick's bombs to max\n"
+               "(GAME_BOMBS_INIT, 3 total) on pickup.\n"
+               "Can also be blown up by bomb/bullet/stick.";
+    case 18: case 19: case 20: case 21:
+        return "Bonus item (scores +500 on pickup, flies up\n"
+               "and vanishes). Static until touched.";
+    case 22: case 23:
+        return "Sound-only event. Plays a sound effect and\n"
+               "does nothing else (no sprite, no collision).\n"
+               "Placed to trigger an audio cue at that spot.";
     // --- Arrow traps ---
     case 25:
         return "Arrow trap. Fires right toward Rick.\n"
@@ -337,12 +388,139 @@ static const char *entInfoText(int ent)
         return "Dog (24x21). Walks left at 6 px/frame.\n"
                "Trigger box = 31x4 tiles (wide detection zone).\n"
                "Default flags: ONCE + TRIGRICK + LETHALI.";
+    // --- Moving stones / falling rocks (type-3, sprite 85) ---
+    case 24:
+        return "Stone - falls. (24x16)\n"
+               "Rocks in place, then falls 4 tile-rows,\n"
+               "then climbs back up to spawn.\n"
+               "Trigger box = 3x3 tiles.";
+    case 28:
+        return "Stone - shoots left. (24x16)\n"
+               "Slams violently LEFT and never comes back.\n"
+               "Trigger box = 4x4 tiles.";
+    case 31:
+        return "Stone - delayed drop. (24x16)\n"
+               "Waits a long time, falls 4 tile-rows,\n"
+               "then returns to spawn.\n"
+               "Trigger box = 4x4 tiles.";
+    case 33:
+        return "Stone - sinks. (24x16)\n"
+               "Falls slowly, tile-row by tile-row, and\n"
+               "stays in place once it reaches the bottom.\n"
+               "Wide trigger = 20x4 tiles.";
+    case 36:
+        return "Stone - double drop. (24x16)\n"
+               "Falls 4 tile-rows, waits a long time, falls\n"
+               "4 more tile-rows, then comes back up quickly.\n"
+               "Trigger box = 3x3 tiles.";
+    case 38:
+        return "Stone - slides then slams. (24x16)\n"
+               "Moves 4 tile-cols to the right, waits,\n"
+               "then slams violently LEFT.\n"
+               "Trigger box = 4x4 tiles.";
+    case 73:
+        return "Stone - shoots right. (24x16)\n"
+               "Slams violently RIGHT and never comes back.\n"
+               "Trigger box = 4x4 tiles.";
+    // --- Egyptian treasure (type-3, 16x16) ---
+    case 34:
+        return "Egyptian treasure (16x16). Triggered once,\n"
+               "then gone. Trigger box = 4x4 tiles.";
+    case 35:
+        return "Egyptian treasure (16x16). Holds, then drops\n"
+               "8 px out of reach. Trigger box = 4x4 tiles.";
+    // --- Wall crusher (type-3, sprite 93) ---
+    case 37:
+        return "Wall crusher (32x8). Slides horizontally\n"
+               "toward Rick and crushes. Trigger box = 4x4 tiles.";
+    // --- Spike walls (type-3) ---
+    case 40:
+        return "Spike wall (24x21). Slides right 2 px/frame\n"
+               "until blocked. Trigger box = 4x4 tiles.";
+    case 41:
+        return "Spike wall (24x21). Slides right 1 px/frame\n"
+               "(slower). Trigger box = 4x4 tiles.";
+    case 42:
+        return "Fireball ball (24x21, sprite 97).\n"
+               "Rolls right, dips, then rolls left, with a\n"
+               "complex path. Guide it with boulders -- carefully.\n"
+               "No snakes, please. (Just a ball. Run, Rick, run!)\n"
+               "Trigger box = 4x4 tiles.";
+    // --- Stone block (type-3, complex path) ---
+    case 43:
+        return "First level's bat\n"
+               "Goes down-right then up-left.";
+    // --- Bomb-like (type-3) ---
+    case 46:
+        return "Bomb trap (24x21). Spawns asleep.\n"
+               "Trigger box = 3x3 tiles.";
+    case 47:
+        return "Sound-trigger (24x21). Invisible, no collision.\n"
+               "On trigger plays a sound effect (ent2.wav)\n"
+               "once, then deactivates (ONCE). Use as an\n"
+               "audio cue, e.g. next to a spike trap.\n"
+               "Trigger box = 4x4 tiles.";
+    case 59:
+        return "Bomb trap (24x16). Holds indefinitely.\n"
+               "Trigger box = 3x3 tiles.";
+    case 62:
+        return "Bomb trap (24x21). Holds indefinitely.\n"
+               "Trigger box = 4x4 tiles.";
+    case 64:
+        return "Fire trap (24x16). Shoots fire upward/outward\n"
+               "to burn Rick. Invisible until it triggers;\n"
+               "sprite = 122 (flame).\n"
+               "Trigger box = 3x3 tiles.";
+    // --- Small watcher traps (type-3, 18x21) ---
+    case 50:
+        return "Watcher (18x21). Scurries left, then hops.\n"
+               "Trigger box = 4x4 tiles.";
+    case 51:
+        return "Watcher (18x21, wide trigger 24x4).\n"
+               "Slides right 3 px/frame. Trigger box = 24x4 tiles.";
+    case 61:
+        return "Watcher (18x21, wide trigger 24x4).\n"
+               "Slides left 3 px/frame. Trigger box = 24x4 tiles.";
+    case 71:
+        return "Watcher (18x21, wide trigger 24x4).\n"
+               "Shifts left, right, left, right alternately.\n"
+               "Trigger box = 24x4 tiles.";
+    // --- Small fast traps (type-3) ---
+    case 58:
+        return "Fast trap (24x16). Darts right, left, right\n"
+               "with pauses. Trigger box = 4x4 tiles.";
+    case 70:
+        return "Fast trap (24x16). Slides left, right, left,\n"
+               "right alternately. Trigger box = 4x4 tiles.";
+    // --- Medium ground traps (type-3) ---
+    case 60:
+        return "Ground trap (24x17). Slides right, speeds up,\n"
+               "then darts left. Trigger box = 4x4 tiles.";
+    case 69:
+        return "Crane. Slides right and left\n"
+               "in alternating bursts. Trigger box = 4x4 tiles.";
+    // --- Fast projectile (type-3) ---
+    case 63:
+        return "Fast projectile (32x8). Fires LEFT at 12 px/frame\n"
+               "for 128 frames (~1536 px). Wide trigger 20x4.";
+    // --- Spitter (type-3) ---
+    case 65:
+        return "Spitter (24x21). Fires UP at 8 px/frame.\n"
+               "Trigger box = 4x6 tiles.";
+    // --- Teleporters (type-3) ---
+    case 67:
+        return "Teleporter (24x21). Jumps Rick in a diamond\n"
+               "pattern. Trigger box = 4x4 tiles.";
+    case 68:
+        return "Teleporter (24x21). Jumps Rick with a\n"
+               "different pattern. Trigger box = 4x4 tiles.";
     // --- Special ---
     case 32:
-        return "Arrow trap. Fires vertically.\n"
-               "3 entity slots shared for arrows.";
-    case 37:
-        return "Arrow trap (horizontal). Fires toward Rick.";
+        return "Arrow trap - vertical (4x21, sprite 90).\n"
+               "Fires a projectile UP at 8 px/frame\n"
+               "for ~70 frames.\n"
+               "3 entity slots shared for arrows.\n"
+               "Trigger box = 4x7 tiles.";
     case 39:
         return "Spike trap. Spikes rise from the ground.\n"
                "Trigger box = 32x32 px. Retriggerable.";
@@ -1089,6 +1267,8 @@ int main(int argc, char *argv[])
                                     defaultFlags |= ENT_FLG_LETHALI;
                                 if (st.selectedEnt == 53 || st.selectedEnt == 66)
                                     defaultFlags |= ENT_FLG_ONCE | ENT_FLG_LETHALI;
+                                if (st.selectedEnt == 69)
+                                    defaultFlags |= ENT_FLG_STOPRICK;
                                 sprites.marks[owner].push_back(MarkEntry{snappedRow, tileCol, fineY, st.selectedEnt, defaultFlags, tileCol, 0});
                                 st.dirty = true;
                             }
@@ -3479,10 +3659,69 @@ int main(int argc, char *argv[])
         ImGui::DragInt("Entity type", &st.selectedEnt, 1.0f, 0, 255);
         {
             // Quick-pick chips for all entity types that have a valid sprite.
+            // Some groups of related traps are pulled out of numeric order
+            // and shown side by side so they're easy to compare:
+            //   dogs (53 slow walker, 66 fast walker),
+            //     grouped together right after ent 38, with fire trap 64
+            //     following the group
+            //   grille traps (45, 49, 52)
+            //   moving stones / falling rocks (24, 28, 73, 31, 33, 36, 38)
+            //   arrow trap 32 sits right after ent 26
+            //   fireball ball (42) and egyptian treasure (34, 35) always go last
+            const int dogEnts[] = {53, 66};
+            const int afterDogsEnts[] = {64};
+            const int grilleEnts[] = {45, 49, 52};
+            const int stoneEnts[] = {24, 28, 73, 31, 33, 36, 38};
+            const int lastEnts[] = {42, 34, 35};
+            const int after23Ents[] = {47};  // sound trigger sits next to ent 23
+            const int after26Ents[] = {32};  // vertical arrow trap sits after ent 26
             std::vector<int> all;
             for (int e = 0; e < (int)entDataTable.size(); e++)
+            {
+                bool grouped = false;
+                for (int g : dogEnts) if (g == e) grouped = true;
+                for (int g : afterDogsEnts) if (g == e) grouped = true;
+                for (int g : grilleEnts) if (g == e) grouped = true;
+                for (int g : stoneEnts) if (g == e) grouped = true;
+                for (int g : lastEnts) if (g == e) grouped = true;
+                for (int g : after23Ents) if (g == e) grouped = true;
+                for (int g : after26Ents) if (g == e) grouped = true;
+                if (grouped) continue;
                 if (entDataTable[e].h > 0 && entDataTable[e].spr < SPRITES_NBR_SPRITES)
                     all.push_back(e);
+            }
+            // Insert ent 47 (sound trigger) right after ent 23.
+            auto it23 = std::find(all.begin(), all.end(), 23);
+            auto pos47 = it23 != all.end() ? it23 + 1 : all.end();
+            for (int g : after23Ents)
+                if (entDataTable[g].h > 0 && entDataTable[g].spr < SPRITES_NBR_SPRITES)
+                    all.insert(pos47, g);
+            // Insert ent 32 (vertical arrow trap) right after ent 26.
+            auto it26 = std::find(all.begin(), all.end(), 26);
+            auto pos32 = it26 != all.end() ? it26 + 1 : all.end();
+            for (int g : after26Ents)
+                if (entDataTable[g].h > 0 && entDataTable[g].spr < SPRITES_NBR_SPRITES)
+                    all.insert(pos32, g);
+            // Insert the dog group (and fire trap 64 after it) right after ent 38.
+            auto it38 = std::find(all.begin(), all.end(), 38);
+            auto posDogs = it38 != all.end() ? it38 + 1 : all.end();
+            std::vector<int> dogBlock;
+            for (int d : dogEnts)
+                if (entDataTable[d].h > 0 && entDataTable[d].spr < SPRITES_NBR_SPRITES)
+                    dogBlock.push_back(d);
+            for (int d : afterDogsEnts)
+                if (entDataTable[d].h > 0 && entDataTable[d].spr < SPRITES_NBR_SPRITES)
+                    dogBlock.push_back(d);
+            all.insert(posDogs, dogBlock.begin(), dogBlock.end());
+            for (int g : grilleEnts)
+                if (entDataTable[g].h > 0 && entDataTable[g].spr < SPRITES_NBR_SPRITES)
+                    all.push_back(g);
+            for (int se : stoneEnts)
+                if (entDataTable[se].h > 0 && entDataTable[se].spr < SPRITES_NBR_SPRITES)
+                    all.push_back(se);
+            for (int le : lastEnts)
+                if (entDataTable[le].h > 0 && entDataTable[le].spr < SPRITES_NBR_SPRITES)
+                    all.push_back(le);
             // Mark which ones are already used on the map.
             std::set<int> used;
             for (int s = 0; s < MAP_NBR_SUBMAPS; s++)
@@ -3763,6 +4002,28 @@ int main(int argc, char *argv[])
                 dl->AddLine(ImVec2(sx0, sy), ImVec2(sx1, sy), IM_COL32(140, 190, 255, 130), 1.5f);
                 char lbl[16]; std::snprintf(lbl, sizeof lbl, "Submap %d", s);
                 dl->AddText(ImVec2(sx0 + 4, sy + 2), IM_COL32(140, 190, 255, 230), lbl);
+            }
+        }
+
+        // Tile-row labels on both sides of the map, just below each block
+        // boundary (tile rows that are multiples of 4), in submap mode --
+        // always visible, whether or not the grid overlay is on. Drawn on
+        // the background draw list, like the submap lines above.
+        if (st.canvasMode == CanvasMode::Submap)
+        {
+            ImDrawList *dl = ImGui::GetBackgroundDrawList();
+            float mapLeft = (0.0f - st.cam.x) * st.cam.zoom;
+            float mapRight = ((float)MAP_COLS * BLOCK_PX - st.cam.x) * st.cam.zoom;
+            int firstR = std::max(0, (int)std::floor(st.cam.y / BLOCK_PX));
+            int lastR = std::min(MAP_ROWS - 1, (int)std::floor((st.cam.y + viewportH / st.cam.zoom) / BLOCK_PX));
+            for (int r = firstR; r <= lastR; r++)
+            {
+                float sy = (r * (float)BLOCK_PX - st.cam.y) * st.cam.zoom;
+                if (sy < -20 || sy > viewportH + 20) continue;
+                char lbl[8]; std::snprintf(lbl, sizeof lbl, "%d", r * 4);
+                ImU32 col = IM_COL32(208, 216, 232, 220);
+                dl->AddText(ImVec2(mapLeft - 36, sy + 3), col, lbl);
+                dl->AddText(ImVec2(mapRight + 5, sy + 3), col, lbl);
             }
         }
 
