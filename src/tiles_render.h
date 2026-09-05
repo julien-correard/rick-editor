@@ -25,6 +25,30 @@ constexpr int BLOCK_PX = 4 * TILE_PX; // 32
 constexpr int ATLAS_BLOCKS_PER_ROW = 16;
 constexpr int BLOCK_ATLAS_PX = ATLAS_BLOCKS_PER_ROW * BLOCK_PX; // 512x512
 
+// --- RUxF unified tile/block space -----------------------------------
+// A RUxF map addresses tiles and blocks as one unified space of 1024
+// elements (4 pages of 256) -- no active bank anywhere: a block's cell
+// stores the *absolute* tile index 0..1023, which selects the physical
+// bank/tile directly. Bank 0 (font + cutscene decor) stays separate and
+// is never addressed from a block. These helpers map an absolute game
+// tile index back to its physical tiles_data bank/tile for when the
+// per-page builders below are used.
+constexpr int RUxF_GAME_PAGES = 4;          // pages 1..4 of 256 game tiles
+constexpr int RUxF_PAGE_TILES = 0x100;      // 256 tiles per page
+constexpr int RUxF_GAME_TILES = RUxF_GAME_PAGES * RUxF_PAGE_TILES; // 1024
+constexpr int RUxF_BLOCKS = 0x400;          // 1024 blocks (4 pages of 256)
+constexpr int FIRST_GAME_BANK = 1;          // physical banks 1..4 = pages 1..4
+
+inline int gameTileToBank(int u) { return FIRST_GAME_BANK + u / RUxF_PAGE_TILES; }
+inline int gameTileToOff (int u) { return u % RUxF_PAGE_TILES; }
+
+// Unified (RUxF) atlas grid: 32x32 tiles of 8px = 256x256 for the 1024
+// game tiles; 32x32 blocks of 32px = 1024x1024 for the 1024 blocks.
+constexpr int UNI_TILES_PER_ROW = 32;
+constexpr int UNI_TILE_ATLAS_PX = UNI_TILES_PER_ROW * TILE_PX;
+constexpr int UNI_BLOCKS_PER_ROW = 32;
+constexpr int UNI_BLOCK_ATLAS_PX = UNI_BLOCKS_PER_ROW * BLOCK_PX;
+
 // Decode une tuile (bank, NbTile) en 64 pixels RGBA (ordre ligne par ligne,
 // gauche a droite). Reprend exactement l'algorithme original de
 // drawtile() : chaque unsigned long de tiles_data[bank][NbTile][ligne] est
@@ -121,6 +145,61 @@ inline SDL_Texture* build_block_atlas(SDL_Renderer* renderer, SDL_Texture* tileA
         }
     }
 
+    SDL_SetRenderTarget(renderer, prevTarget);
+    return blockAtlas;
+}
+
+// Unified (RUxF) tile atlas: all 1024 game tiles in one texture, composed
+// from the physical per-page banks (banks 1-4).
+inline SDL_Texture* build_tile_atlas_unified(SDL_Renderer* renderer)
+{
+    SDL_Texture* tex = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32,
+                                          SDL_TEXTUREACCESS_STATIC,
+                                          UNI_TILE_ATLAS_PX, UNI_TILE_ATLAS_PX);
+    SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_NONE);
+    static Uint32 pixels[UNI_TILE_ATLAS_PX * UNI_TILE_ATLAS_PX];
+    for (auto &p : pixels) p = 0xFF000000u;
+    for (int u = 0; u < RUxF_GAME_TILES; u++)
+    {
+        Uint32 tile_px[TILE_PX * TILE_PX];
+        decode_tile(gameTileToBank(u), gameTileToOff(u), tile_px);
+        int cx = (u % UNI_TILES_PER_ROW) * TILE_PX;
+        int cy = (u / UNI_TILES_PER_ROW) * TILE_PX;
+        for (int y = 0; y < TILE_PX; y++)
+            for (int x = 0; x < TILE_PX; x++)
+                pixels[(cy + y) * UNI_TILE_ATLAS_PX + (cx + x)] = tile_px[y * TILE_PX + x];
+    }
+    SDL_UpdateTexture(tex, nullptr, pixels, UNI_TILE_ATLAS_PX * sizeof(Uint32));
+    return tex;
+}
+
+// Unified (RUxF) block atlas: all 1024 blocks in one texture, each cell
+// holding an absolute tile index (0-1023) looked up in the unified tile
+// atlas.
+inline SDL_Texture* build_block_atlas_unified(SDL_Renderer* renderer, SDL_Texture* tileAtlasUni)
+{
+    SDL_Texture* blockAtlas = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32,
+                                                 SDL_TEXTUREACCESS_TARGET,
+                                                 UNI_BLOCK_ATLAS_PX, UNI_BLOCK_ATLAS_PX);
+    SDL_SetTextureBlendMode(blockAtlas, SDL_BLENDMODE_NONE);
+    SDL_Texture* prevTarget = SDL_GetRenderTarget(renderer);
+    SDL_SetRenderTarget(renderer, blockAtlas);
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+    SDL_RenderClear(renderer);
+    for (int b = 0; b < RUxF_BLOCKS; b++)
+    {
+        int bx = (b % UNI_BLOCKS_PER_ROW) * BLOCK_PX;
+        int by = (b / UNI_BLOCKS_PER_ROW) * BLOCK_PX;
+        for (int i = 0; i < 16; i++)
+        {
+            int u = map_blocks[b][i];                 // absolute 0..1023
+            int tx = (u % UNI_TILES_PER_ROW) * TILE_PX;
+            int ty = (u / UNI_TILES_PER_ROW) * TILE_PX;
+            SDL_Rect src{tx, ty, TILE_PX, TILE_PX};
+            SDL_Rect dst{bx + (i % 4) * TILE_PX, by + (i / 4) * TILE_PX, TILE_PX, TILE_PX};
+            SDL_RenderCopy(renderer, tileAtlasUni, &src, &dst);
+        }
+    }
     SDL_SetRenderTarget(renderer, prevTarget);
     return blockAtlas;
 }

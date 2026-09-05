@@ -65,11 +65,14 @@ struct MapStartInfo { int x = 0, y = 0, row = 0, submap = 0; };
 
 // dir: 0 = going down, 1 = going up.
 // rowAbs: absolute row (this editor's coordinate space) of the trigger,
-//   on the submap that owns this exit.
+//   on the submap that owns this exit. Meaningless for RUxF (left/right
+//   transitions have no row trigger) but kept for UI bookkeeping.
 // targetSubmap: destination screen index, or SUBMAP_END_OF_LEVEL.
 // targetRowAbs: absolute row Rick appears at on the target submap
 //   (meaningless/unused when targetSubmap == SUBMAP_END_OF_LEVEL).
-struct ConnectEntry { int dir = 0; int rowAbs = 0; int targetSubmap = SUBMAP_END_OF_LEVEL; int targetRowAbs = 0; };
+// col: arrival tile column on the target submap (0-31). RUxF only;
+//   legacy format has no column; set to 0 for legacy exits.
+struct ConnectEntry { int dir = 0; int rowAbs = 0; int targetSubmap = SUBMAP_END_OF_LEVEL; int targetRowAbs = 0; int col = 0; };
 
 struct ConnectionsData
 {
@@ -119,6 +122,7 @@ inline ConnectionsData decodeConnectionsFromRaw(const std::array<SubmapRaw, MAP_
             e.targetRowAbs = (r.submap != SUBMAP_END_OF_LEVEL && r.submap < MAP_NBR_SUBMAPS)
                             ? submapStartRow(out.submaps[r.submap]) + r.rowin
                             : 0;
+            e.col = 0; // legacy has no column
             out.exits[i].push_back(e);
             c++;
         }
@@ -160,11 +164,46 @@ inline bool loadXrickConnections(const fs::path &path, ConnectionsData &out, std
 
     size_t coff = 0, csize = 0;
     if (!find_symbol_file_offset(buf, "map_connect", coff, csize, err)) return false;
-    if (csize != (size_t)MAP_NBR_CONNECT * 4)
+    bool ruxfBin = (csize == MAP_NBR_CONNECT * 8); // RUxF: 8-byte connect_t
+    if (csize != (size_t)MAP_NBR_CONNECT * 4 && !ruxfBin)
     {
         err = "map_connect has an unexpected size (" + std::to_string(csize) + " bytes) -- incompatible xrick build.";
         return false;
     }
+
+    // RUxF connectors: connect_t {dir, submap, colin, pad, rowout(U16), rowin(U16)} = 8 bytes.
+    // rowin AND rowout are absolute. Legacy: 4 bytes {dir,rowout,submap,rowin} local rows.
+    if (ruxfBin)
+    {
+        for (int i = 0; i < MAP_NBR_SUBMAPS; i++)
+        {
+            out.submaps[i] = {rawSubmaps[i].page, rawSubmaps[i].bnum, rawSubmaps[i].mark};
+            out.exits[i].clear();
+            int c = rawSubmaps[i].connect;
+            while (c >= 0 && c < MAP_NBR_CONNECT)
+            {
+                uint8_t dir    = buf[coff + c * 8 + 0];
+                uint8_t submap = buf[coff + c * 8 + 1];
+                uint8_t colin  = buf[coff + c * 8 + 2];
+                uint16_t rowout, rowin;
+                std::memcpy(&rowout, &buf[coff + c * 8 + 4], 2);
+                std::memcpy(&rowin,  &buf[coff + c * 8 + 6], 2);
+                if (dir == 0xff) break;
+                ConnectEntry e;
+                e.dir = dir;
+                e.targetSubmap = submap;
+                e.targetRowAbs = rowin;   // already absolute
+                e.rowAbs = rowout;        // exit tile row, absolute
+                e.col = colin;
+                out.exits[i].push_back(e);
+                c++;
+            }
+        }
+        out.loaded = true;
+        err.clear();
+        return true; // skip legacy decodeConnectionsFromRaw
+    }
+
     std::array<ConnectRaw, MAP_NBR_CONNECT> rawConnect;
     for (int i = 0; i < MAP_NBR_CONNECT; i++)
         rawConnect[i] = {buf[coff + i * 4 + 0], buf[coff + i * 4 + 1], buf[coff + i * 4 + 2], buf[coff + i * 4 + 3]};
@@ -198,18 +237,117 @@ inline bool loadXrickConnections(const fs::path &path, ConnectionsData &out, std
 
 // Rebuilds the flat map_connect array (and each submap's `connect` start
 // offset) from the per-submap exit lists currently in `data`, converting
+// The engine's map_chain() picks the exit of the matching direction whose
+// rowout is the FIRST one >= Rick's current row when he walks off the edge
+// (bracketing, with a fallback to the last one), which assumes each submap's
+// connectors are packed in ASCENDING rowout order. The editor does not force
+// that order on screen, so sort before packing -- otherwise (e.g. an
+// upper-than-lower row stored first) a higher exit would bracket onto the
+// lower connector. `data.exits[i]` itself is left untouched: the on-screen
+// order, the .map round-trip and the UI stay exactly as the user arranged.
+inline std::vector<size_t> sortedExitOrder(const std::vector<ConnectEntry> &v)
+{
+    std::vector<size_t> idx(v.size());
+    for (size_t k = 0; k < v.size(); k++) idx[k] = k;
+    std::stable_sort(idx.begin(), idx.end(),
+        [&](size_t a, size_t b) { return v[a].rowAbs < v[b].rowAbs; });
+    return idx;
+}
+
 // absolute rows back to each submap's local 0-255 range. Fails if a row
 // doesn't fit in that range, or if the total number of slots needed
 // exceeds the fixed capacity of the original binary's array.
-inline bool repackConnections(ConnectionsData &data, std::string &err)
+inline bool repackConnections(ConnectionsData &data, std::string &err, bool ruxf = false)
 {
+    if (ruxf)
+    {
+        // RUxF connectors: connect_t is {dir(U8), submap(U8), colin(U8),
+        // pad(U8), rowout(U16 LE), rowin(U16 LE)} = 8 bytes per slot (see the
+        // engine's include/maps.h). rowin AND rowout are ABSOLUTE (no per-
+        // submap base). colin is the arrival tile column; rowout is the exit
+        // tile row on this submap, used by the engine to pick the right
+        // connector by Rick's height (bracketing). Capacity is
+        // MAP_NBR_CONNECT (153) slots = 1224 bytes.
+        const int RUxF_CONNECT_STRIDE = 8;
+        std::vector<uint8_t> flat;
+        flat.reserve(MAP_NBR_CONNECT * RUxF_CONNECT_STRIDE);
+        for (int i = 0; i < MAP_NBR_SUBMAPS; i++)
+        {
+            for (size_t k : sortedExitOrder(data.exits[i]))
+            {
+                auto &e = data.exits[i][k];
+                if (e.targetSubmap != SUBMAP_END_OF_LEVEL && (e.targetSubmap < 0 || e.targetSubmap >= MAP_NBR_SUBMAPS))
+                {
+                    err = "Submap " + std::to_string(i) + ": invalid target submap " + std::to_string(e.targetSubmap);
+                    return false;
+                }
+                if (e.targetRowAbs < 0 || e.targetRowAbs > 65535)
+                {
+                    err = "Submap " + std::to_string(i) + ": target row " + std::to_string(e.targetRowAbs)
+                        + " out of RUxF range (0-65535).";
+                    return false;
+                }
+                if (e.rowAbs < 0 || e.rowAbs > 65535)
+                {
+                    err = "Submap " + std::to_string(i) + ": exit row " + std::to_string(e.rowAbs)
+                        + " out of RUxF range (0-65535).";
+                    return false;
+                }
+                uint8_t col = (uint8_t)std::clamp(e.col, 0, 31);
+                uint8_t dir = (uint8_t)(e.dir & 1);
+                uint8_t target = (uint8_t)e.targetSubmap;
+                uint16_t rowout = (uint16_t)e.rowAbs;
+                uint16_t rowin  = (uint16_t)e.targetRowAbs;
+                uint8_t outLo = (uint8_t)(rowout & 0xff), outHi = (uint8_t)(rowout >> 8);
+                uint8_t inLo  = (uint8_t)(rowin & 0xff),  inHi  = (uint8_t)(rowin >> 8);
+                flat.insert(flat.end(), {dir, target, col, 0x00, outLo, outHi, inLo, inHi});
+            }
+            flat.insert(flat.end(), {0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}); // end marker
+        }
+        if ((int)(flat.size() / RUxF_CONNECT_STRIDE) > MAP_NBR_CONNECT)
+        {
+            err = "Too many exits (" + std::to_string(flat.size() / RUxF_CONNECT_STRIDE)
+                + " slots needed) -- the RUxF engine only has room for "
+                + std::to_string(MAP_NBR_CONNECT) + " total (across all submaps, "
+                "including one end-marker per submap).";
+            return false;
+        }
+        while ((int)(flat.size() / RUxF_CONNECT_STRIDE) < MAP_NBR_CONNECT)
+            flat.insert(flat.end(), {0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00});
+        data.packedConnect = flat;
+
+        data.packedSubmaps.assign(MAP_NBR_SUBMAPS * 8, 0);
+        std::array<uint16_t, MAP_NBR_SUBMAPS> connectStart{};
+        {
+            int idx = 0;
+            for (int i = 0; i < MAP_NBR_SUBMAPS; i++)
+            {
+                connectStart[i] = (uint16_t)idx;
+                idx += (int)data.exits[i].size() + 1;
+            }
+        }
+        for (int i = 0; i < MAP_NBR_SUBMAPS; i++)
+        {
+            uint16_t page = (uint16_t)data.submaps[i].page;
+            uint16_t bnum = (uint16_t)data.submaps[i].bnum;
+            uint16_t connect = connectStart[i];
+            uint16_t mark = (uint16_t)data.submaps[i].mark;
+            std::memcpy(&data.packedSubmaps[i * 8 + 0], &page, 2);
+            std::memcpy(&data.packedSubmaps[i * 8 + 2], &bnum, 2);
+            std::memcpy(&data.packedSubmaps[i * 8 + 4], &connect, 2);
+            std::memcpy(&data.packedSubmaps[i * 8 + 6], &mark, 2);
+        }
+        err.clear();
+        return true;
+    }
     std::vector<ConnectRaw> flat;
     flat.reserve(MAP_NBR_CONNECT);
     for (int i = 0; i < MAP_NBR_SUBMAPS; i++)
     {
         int base = submapStartRow(data.submaps[i]);
-        for (auto &e : data.exits[i])
+        for (size_t k : sortedExitOrder(data.exits[i]))
         {
+            auto &e = data.exits[i][k];
             int localOut = e.rowAbs - base;
             if (localOut < 0 || localOut > 255)
             {

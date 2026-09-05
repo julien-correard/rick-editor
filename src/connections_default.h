@@ -760,20 +760,20 @@ static const std::array<MapStartRaw, MAP_NBR_MAPS> defaultMapStartsRaw = {{
 
 // Entity type -> sprite/step art data, from the real xrick source's
 // dat_ents.c (ent_entdata: w, h, spr, sni -- trig_w/trig_h/snd omitted,
-// not needed here). ENT_NBR_ENTDATA is 0x4a (74, valid ids 0-73) --
-// confirmed directly from ents.h; an earlier version of this table
-// mistakenly had 76 entries (misreading dat_ents.c's two commented-out
-// dead rows as live data), which gave entities 67/68 a bogus sprite
-// index and shifted every entity from 69 on by 2 -- both silently wrong
-// for several sprites actually used in the stock level (69-73, confirmed
-// against the real binary). spr==0 means no distinct sprite art is
+// not needed here). ENT_NBR_ENTDATA is 0x4d (77, valid ids 0-76):
+// ids 0-73 confirmed directly from ents.h (an earlier version of this
+// table mistakenly had 76 entries -- misreading dat_ents.c's two
+// commented-out dead rows as live data), plus id 74 added by the
+// modified xrick build (dedicated round-trip rolling barrel, sprseq
+// base 146, mvstep 784), plus the slow clones 75/76 (bullet/missile
+// that charge before firing). spr==0 means no distinct sprite art is
 // defined for that entity type (falls back to a placeholder marker).
 // sni is step_no_i: normally an index into ent_mvstep for type-3 traps'
 // wake sequence, but reused as a raw sprite index (sprbase) for type
 // 1a/1b/2 entities when flags==0xF0 -- see ENT_FLG_MORPH_TO_TYPE2 in
 // xrick_marks.h.
 struct EntData { int w, h, spr, sni; };
-static const std::array<EntData, 74> entDataTable = {{
+static const std::array<EntData, 78> entDataTable = {{
   {0, 0, 0, 0}, // ent 0
   {24, 21, 0, 0}, // ent 1
   {0, 0, 0, 0}, // ent 2
@@ -833,7 +833,7 @@ static const std::array<EntData, 74> entDataTable = {{
   {24, 21, 115, 118}, // ent 56 (soldier who shoots, sprbase 83 -> sprite 115)
   {16, 8, 0, 7}, // ent 57 (trap fires bullets, sprbase 87 -> sprite 0)
   {24, 16, 117, 126}, // ent 58
-  {24, 16, 92, 9}, // ent 59
+  {24, 16, 122, 9}, // ent 59 (flame trap, sprite 122)
   {24, 17, 120, 136}, // ent 60
   {18, 21, 106, 142}, // ent 61
   {24, 21, 109, 9}, // ent 62
@@ -841,11 +841,15 @@ static const std::array<EntData, 74> entDataTable = {{
   {24, 16, 122, 9}, // ent 64 (fire trap, sprite 122)
   {24, 21, 45, 18}, // ent 65
   {24, 21, 109, 146}, // ent 66 (dog, spr_slept=0x6d)
-  {24, 21, 128, 148}, // ent 67
-  {24, 21, 128, 191}, // ent 68
+  {24, 21, 38, 148}, // ent 67 (final level explosion trigger, sprite 38)
+  {24, 21, 38, 191}, // ent 68 (final level explosion trigger, sprite 38)
   {24, 17, 120, 229}, // ent 69
   {24, 16, 117, 234}, // ent 70
   {18, 21, 106, 244}, // ent 71
   {32, 16, 101, 5}, // ent 72 (stone block, sprbase 8 → sprite 101)
   {24, 16, 85, 5}, // ent 73
+  {18, 21, 106, 784}, // ent 74 (round-trip barrel: sprseq base 146 → sprite 106, mvstep 784)
+  {16, 8, 0, 791}, // ent 75 (slow bullet trap, clone of 57: charges 150 then fires)
+  {32, 8, 108, 795}, // ent 76 (slow missile trap, clone of 63: charges 200 then fires)
+  {24, 21, 213, 213}, // ent 77 (RUxF life bonus: +1 life below 6, else 500 pts)
 }};

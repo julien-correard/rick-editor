@@ -115,6 +115,7 @@ struct EditorState
     Camera cam;
     int bank = 1;              // same meaning as the old DisBank (originally 1 or 2; 0 is reachable too now)
     int selectedBlock = 1;     // active block in the palette, placed on left click
+    int blockPage = 0;         // RUxF-only: which page of 256 blocks the palette is showing (0-3)
     Selection sel;
     bool painting = false;     // left button held = paint continuously
     bool picking = false;      // right button held = keep picking the block under the cursor
@@ -145,6 +146,7 @@ struct EditorState
     CanvasMode canvasMode = CanvasMode::Block;
     bool showGrid = false;         // always-available block-grid overlay
     bool showTriggerBoxes = true;  // show trigger-box overlay for trap entities
+    bool showToolsPanel = true;    // show the right-side tools panel (Submap/Blocks/Sprites)
 
     // Sprites
     bool showSprites = true;       // overlay toggle -- can be turned off to focus on tile editing
@@ -154,6 +156,22 @@ struct EditorState
 
     // Map start placement mode: -1 = off, 0..MAP_NBR_MAPS-1 = placing that map's start position
     int placeStartMode = -1;
+
+    // Rick Ultra Xpanded Features: when true, the map may use the extended
+    // entity ids (74-76, and any that follow) that only the modified RUxP
+    // xrick executable understands, and saving writes the RKMC format.
+    // When false (legacy), the map is compatible with the original xrick
+    // and new entities are hidden/blocked.
+    bool ruxp = false;
+
+    // Highest entity id usable in legacy mode. The stock binary has
+    // ENT_NBR_ENTDATA = 0x4a (74 entries, valid ids 0-73); ids 74+ are
+    // RUxP additions.
+    int maxLegacyEnt() const { return 73; }
+
+    // Set when the user clicks "Use Rick Ultra Xpanded Features" -- opens
+    // the informational confirmation dialog before actually enabling.
+    bool confirmEnableRuxp = false;
 };
 
 // State for the standalone Tile Editor window -- separate from the map
@@ -249,20 +267,22 @@ static void entTriggerSize(int ent, int &tw, int &th)
     case 55: tw =  4; th = 4; return;  // door bottom
     case 56: tw =  4; th = 4; return;  // shooting soldier
     case 57: tw = 16; th = 4; return;  // trap fires bullets, wide trigger zone
+    case 75: tw = 16; th = 4; return;  // slow bullet trap (clone of 57)
     case 58: tw =  4; th = 4; return;  // small trap
-    case 59: tw =  3; th = 3; return;  // bomb-like
-    case 60: tw =  4; th = 4; return;  // small trap
+    case 59: tw =  3; th = 3; return;  // flame trap (left)
+    case 60: tw =  4; th = 4; return;  // crane
     case 61: tw = 24; th = 4; return;  // wide trap
     case 62: tw =  4; th = 4; return;  // bomb-like
     case 63: tw = 20; th = 4; return;  // fast projectile
-    case 64: tw =  3; th = 3; return;  // bomb-like
+    case 76: tw = 20; th = 4; return;  // slow missile (clone of 63)
+    case 64: tw =  3; th = 3; return;  // flame trap (left)
     case 65: tw =  4; th = 6; return;  // spitter
     case 66: tw = 31; th = 4; return;  // dog, walks left, wide trigger zone
     case 67: tw =  4; th = 4; return;  // teleport
     case 68: tw =  4; th = 4; return;  // teleport
-    case 69: tw =  4; th = 4; return;  // small trap
+    case 69: tw =  4; th = 4; return;  // crane
     case 70: tw =  4; th = 4; return;  // small trap
-    case 71: tw = 24; th = 4; return;  // wide trap
+    case 71: case 74: tw = 24; th = 4; return;  // wide trap (74: rolling barrel)
     case 72: tw =  4; th = 4; return;  // stone block, slides right
     case 73: tw =  4; th = 4; return;  // slow right trap
     case 16: case 17: case 18: case 19: case 21:
@@ -276,7 +296,7 @@ static const char *entInfoText(int ent)
 {
     switch (ent)
     {
-    // --- Falling grille traps (type-3, sprite 102) ---
+    // --- Grille traps (type-3, sprite 102) ---
     case 45:
         return "Grille trap (wide trigger, 160x32 px).\n"
                "Falls 32 px onto the player, holds, then retracts.\n"
@@ -288,7 +308,18 @@ static const char *entInfoText(int ent)
     case 52:
         return "Grille trap (narrow trigger, 32x32 px).\n"
                "Rises 32 px first, then slams down 32 px.\n"
-               "Retriggerable. Trigger box = rick walk-through zone.";
+               "Retriggerable. Trigger box = 4x4 tiles.";
+    // --- Barrels / tonneaux (type-3, sprites 102/106/107) ---
+    case 50:
+        return "Barrel -- falls down-LEFT (18x21).\n"
+               "Rolls left, then drops diagonally left+down.\n"
+               "Retriggerable. Trigger box = 4x4 tiles.";
+    case 51:
+        return "Barrel -- rolls RIGHT (18x21, wide trigger 24x4).\n"
+               "Rolls right 3 px/frame. Trigger box = 24x4 tiles.";
+    case 61:
+        return "Barrel -- rolls LEFT (18x21, wide trigger 24x4).\n"
+               "Rolls left 3 px/frame. Trigger box = 24x4 tiles.";
     // --- Walkers / climbers (type 1a/1b/2) ---
     case 4: case 7: case 10: case 13:
         return "Patrol walker (type 1a). Walks right from spawn,\n"
@@ -342,7 +373,7 @@ static const char *entInfoText(int ent)
                "slides left ~560 px then loops.\n"
                "Use dynamite to clear the way.";
     case 48:
-        return "Stone block (32x16). Blocks Rick's path.\n"
+        return "Lethal rock that blocks the passage (32x16).\n"
                "When triggered, follows a complex path:\n"
                "left → down → left → pause → right → up\n"
                "→ pause → right → fade → up → right → loop.\n"
@@ -379,6 +410,11 @@ static const char *entInfoText(int ent)
                "Trigger zone = 16x4 tiles (wide, flat).\n"
                "Projectile travels left for ~70 frames then stops.\n"
                "3 entity slots shared for projectiles.";
+    case 75:
+        return "Slow bullet trap (16x8). Same as 57 but fires\n"
+               "slower: charges ~150 frames, then fires a\n"
+               "projectile LEFT for ~70 frames (same as 57).\n"
+               "Trigger zone = 16x4 tiles.";
     // --- Dog (type-3, walks along ground) ---
     case 53:
         return "Dog (24x21). Walks left slowly at 2 px/frame.\n"
@@ -461,30 +497,23 @@ static const char *entInfoText(int ent)
                "audio cue, e.g. next to a spike trap.\n"
                "Trigger box = 4x4 tiles.";
     case 59:
-        return "Bomb trap (24x16). Holds indefinitely.\n"
+        return "Flame trap (24x16). Shoots flame to the LEFT,\n"
+               "stops after a moment. Invisible until triggered;\n"
+               "sprite = 122 (flame).\n"
                "Trigger box = 3x3 tiles.";
     case 62:
         return "Bomb trap (24x21). Holds indefinitely.\n"
                "Trigger box = 4x4 tiles.";
     case 64:
-        return "Fire trap (24x16). Shoots fire upward/outward\n"
-               "to burn Rick. Invisible until it triggers;\n"
+        return "Flame trap (24x16). Shoots flame to the LEFT,\n"
+               "stops after a moment. Invisible until it triggers;\n"
                "sprite = 122 (flame).\n"
                "Trigger box = 3x3 tiles.";
-    // --- Small watcher traps (type-3, 18x21) ---
-    case 50:
-        return "Watcher (18x21). Scurries left, then hops.\n"
-               "Trigger box = 4x4 tiles.";
-    case 51:
-        return "Watcher (18x21, wide trigger 24x4).\n"
-               "Slides right 3 px/frame. Trigger box = 24x4 tiles.";
-    case 61:
-        return "Watcher (18x21, wide trigger 24x4).\n"
-               "Slides left 3 px/frame. Trigger box = 24x4 tiles.";
-    case 71:
-        return "Watcher (18x21, wide trigger 24x4).\n"
-               "Shifts left, right, left, right alternately.\n"
-               "Trigger box = 24x4 tiles.";
+    // --- Barrels / tonneaux (type-3, 18x21) ---
+    case 74:
+        return "Barrel (18x21, wide trigger 24x4). Rolls LEFT\n"
+               "20 tiles (160 px), then rolls RIGHT back to its\n"
+               "place. Trigger box = 24x4 tiles.";
     // --- Small fast traps (type-3) ---
     case 58:
         return "Fast trap (24x16). Darts right, left, right\n"
@@ -492,28 +521,38 @@ static const char *entInfoText(int ent)
     case 70:
         return "Fast trap (24x16). Slides left, right, left,\n"
                "right alternately. Trigger box = 4x4 tiles.";
-    // --- Medium ground traps (type-3) ---
+    // --- Cranes (type-3, sprite 104, 24x17) ---
     case 60:
-        return "Ground trap (24x17). Slides right, speeds up,\n"
-               "then darts left. Trigger box = 4x4 tiles.";
+        return "Crane (24x17). Holds still 16 frames, then slides\n"
+               "RIGHT, speeding up (+1 then +3 px/frame), cruises\n"
+               "out ~168 px at +2 px/frame, then darts back LEFT\n"
+               "at 4 px/frame (~equal distance), ending ~2 px right\n"
+               "of its start. Loops. Trigger box = 4x4 tiles.";
     case 69:
-        return "Crane. Slides right and left\n"
-               "in alternating bursts. Trigger box = 4x4 tiles.";
-    // --- Fast projectile (type-3) ---
+        return "Crane (24x17). Slides RIGHT 64 frames at +2 px/frame\n"
+               "(128 px), back LEFT 32 frames (64 px), RIGHT again\n"
+               "54 frames (108 px), then LEFT 86 frames (172 px),\n"
+               "ending exactly at its start. Loops.\n"
+               "Trigger box = 4x4 tiles.";
+    // --- Missile (type-3) ---
     case 63:
-        return "Fast projectile (32x8). Fires LEFT at 12 px/frame\n"
+        return "Missile (32x8). Shoots to the LEFT at 12 px/frame\n"
                "for 128 frames (~1536 px). Wide trigger 20x4.";
+    case 76:
+        return "Slow missile (32x8). Same as 63 but fires slower:\n"
+               "charges ~200 frames, then shoots a missile LEFT\n"
+               "at 12 px/frame for 128 frames (same as 63).\n"
+               "Wide trigger 20x4.";
     // --- Spitter (type-3) ---
     case 65:
         return "Spitter (24x21). Fires UP at 8 px/frame.\n"
                "Trigger box = 4x6 tiles.";
-    // --- Teleporters (type-3) ---
+    // --- Final-level explosion triggers (type-3) ---
     case 67:
-        return "Teleporter (24x21). Jumps Rick in a diamond\n"
-               "pattern. Trigger box = 4x4 tiles.";
     case 68:
-        return "Teleporter (24x21). Jumps Rick with a\n"
-               "different pattern. Trigger box = 4x4 tiles.";
+        return "Final level explosions. Both are just there to\n"
+               "trigger the destruction sequence on the last\n"
+               "screen of the game. Trigger box = 4x4 tiles.";
     // --- Special ---
     case 32:
         return "Arrow trap - vertical (4x21, sprite 90).\n"
@@ -521,10 +560,14 @@ static const char *entInfoText(int ent)
                "for ~70 frames.\n"
                "3 entity slots shared for arrows.\n"
                "Trigger box = 4x7 tiles.";
-    case 39:
+case 39:
         return "Spike trap. Spikes rise from the ground.\n"
                "Trigger box = 32x32 px. Retriggerable.";
-    default:
+case 77:
+         return "RUxF life bonus (sprite 213).\n"
+                "Gives an extra life when Rick has fewer than 6,\n"
+                "otherwise 500 points.";
+     default:
         if (ent >= 0x18)
             return "Type-3 entity. Starts asleep, wakes on trigger.\n"
                    "Movement sequence defined in ent_mvstep.";
@@ -542,6 +585,8 @@ struct BlockEditorState
 {
     bool open = false;
     int bank = 1;            // preview bank only -- map_blocks itself is bank-independent
+    int blockPage = 0;       // RUxF-only: page of 256 blocks (0-3); legacy ignores (single page)
+    int pickPage = 0;        // RUxF-only: tile-picker page (0-3); legacy ignores
     int selectedBlock = -1;  // -1 = nothing selected yet
     int selectedCell = 0;    // 0-15, which of the block's 16 tile slots a picked tile goes into
     bool swapMode = false;   // "Swap with..." armed -- next block clicked in the grid swaps with selectedBlock
@@ -740,13 +785,17 @@ static void drawMap(SDL_Renderer* renderer, SDL_Texture* blockAtlas, const Edito
 
     float destSize = BLOCK_PX * st.cam.zoom;
 
+    // RUxF uses the unified 1024-block atlas (32 blocks per row); the
+    // legacy/stock path uses the per-page 256-block atlas (16 per row).
+    const int blocksPerRow = st.ruxp ? UNI_BLOCKS_PER_ROW : ATLAS_BLOCKS_PER_ROW;
+
     for (int row = firstRow; row <= lastRow; row++)
     {
         for (int col = firstCol; col <= lastCol; col++)
         {
             int blockIdx = map_bnums[mapIndex(col, row)];
-            int bx = (blockIdx % ATLAS_BLOCKS_PER_ROW) * BLOCK_PX;
-            int by = (blockIdx / ATLAS_BLOCKS_PER_ROW) * BLOCK_PX;
+            int bx = (blockIdx % blocksPerRow) * BLOCK_PX;
+            int by = (blockIdx / blocksPerRow) * BLOCK_PX;
             SDL_Rect src{bx, by, BLOCK_PX, BLOCK_PX};
 
             SDL_FRect dst;
@@ -977,7 +1026,27 @@ static void doSave(EditorState &st, FileDialog &fd, const ConnectionsData &conn,
 {
     if (st.currentPath.empty()) { requestSaveAs(fd, st.currentPath); return; }
     std::string err;
-    if (saveMapFileWithSprites(st.currentPath, conn, sprites, eflg, texts, err)) { st.dirty = false; st.addRecentFile(st.currentPath); saveConfig(st, fd); }
+    if (saveMapFileWithSprites(st.currentPath, conn, sprites, eflg, texts, st.ruxp, err)) { st.dirty = false; st.addRecentFile(st.currentPath); saveConfig(st, fd); }
+}
+
+// Whether a given xrick executable understands the Rick Ultra Xpanded
+// entities (ids 74+). Detected by the size of its `ent_entdata` symbol:
+// each entdata_t entry is 10 bytes (U8 w,h; U16 spr,sni; U8 tw,th,snd,
+// aligned to 2). The stock binary has 74 entries (740 bytes); the RUxP
+// build has 77+ (>= 770 bytes).
+static bool xrickSupportsRuxp(const fs::path &xrickPath, std::string &err)
+{
+    std::ifstream in(xrickPath, std::ios::binary);
+    if (!in) { err = "Could not open " + xrickPath.string(); return false; }
+    std::vector<uint8_t> buf((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    in.close();
+    size_t off = 0, size = 0;
+    if (!find_symbol_file_offset(buf, "ent_entdata", off, size, err))
+    {
+        err = "Could not locate ent_entdata in " + xrickPath.string() + " (" + err + ")";
+        return false;
+    }
+    return size >= (size_t)77 * 10;
 }
 
 // Rebuilds the tile atlas AND the block atlas for one bank after a tile
@@ -1000,6 +1069,24 @@ static void rebuildBlockAtlasOnly(SDL_Renderer *renderer, SDL_Texture *tileAtlas
 {
     SDL_DestroyTexture(blockAtlas[bank]);
     blockAtlas[bank] = build_block_atlas(renderer, tileAtlas[bank]);
+}
+
+// Rebuilds the RUxF unified tile AND block atlases after a game-tile
+// graphic or the tile-page banks changed.
+static void rebuildUnifiedTileAtlases(SDL_Renderer *renderer, SDL_Texture *&tileAtlasUni, SDL_Texture *&blockAtlasUni)
+{
+    SDL_DestroyTexture(blockAtlasUni);
+    SDL_DestroyTexture(tileAtlasUni);
+    tileAtlasUni = build_tile_atlas_unified(renderer);
+    blockAtlasUni = build_block_atlas_unified(renderer, tileAtlasUni);
+}
+
+// Rebuilds only the RUxF unified block atlas -- for when map_blocks
+// changed (Block Editor / block palette) but tile graphics didn't.
+static void rebuildUnifiedBlockAtlas(SDL_Renderer *renderer, SDL_Texture *tileAtlasUni, SDL_Texture *&blockAtlasUni)
+{
+    SDL_DestroyTexture(blockAtlasUni);
+    blockAtlasUni = build_block_atlas_unified(renderer, tileAtlasUni);
 }
 
 // Color-codes a tile thumbnail's border by its hazard flags (map_eflg_c)
@@ -1126,7 +1213,8 @@ int main(int argc, char *argv[])
     ImGui_ImplSDL2_InitForSDLRenderer(window, renderer);
     ImGui_ImplSDLRenderer2_Init(renderer);
 
-    // Tile/block atlases for every available bank (0, 1, 2).
+    // Tile/block atlases for every available bank (0, 1, 2), plus the
+    // RUxF unified game-tile/block atlases (1024 tiles + 1024 blocks).
     SDL_Texture* tileAtlas[TILES_NBR_BANKS];
     SDL_Texture* blockAtlas[TILES_NBR_BANKS];
     for (int b = 0; b < TILES_NBR_BANKS; b++)
@@ -1134,6 +1222,8 @@ int main(int argc, char *argv[])
         tileAtlas[b] = build_tile_atlas(renderer, b);
         blockAtlas[b] = build_block_atlas(renderer, tileAtlas[b]);
     }
+    SDL_Texture* tileAtlasUni = build_tile_atlas_unified(renderer);
+    SDL_Texture* blockAtlasUni = build_block_atlas_unified(renderer, tileAtlasUni);
     SDL_Texture* spriteAtlas = build_sprite_atlas(renderer);
 
     EditorState st;
@@ -1244,6 +1334,11 @@ int main(int argc, char *argv[])
                             int owner = submapForAbsRow(connections, tileRow);
                             if (owner >= 0)
                             {
+                                // In legacy mode, refuse to place RUxP-only entities
+                                // (ids past 73) -- they'd silently break the original
+                                // xrick the map is meant to be compatible with.
+                                if (!st.ruxp && st.selectedEnt > st.maxLegacyEnt())
+                                    continue;
                                 // The real engine only respects rows that are a multiple
                                 // of 8 LOCAL tile-rows from the submap's start (masks the
                                 // raw byte with & 0xf8) -- fold the clicked row's remainder
@@ -1260,7 +1355,7 @@ int main(int argc, char *argv[])
                                 // placed ones to react to Rick walking into the trigger box,
                                 // since that's the overwhelmingly common case. Other entity
                                 // types (walkers, etc.) don't consult these flags, so 0 is fine.
-                                int defaultFlags = (st.selectedEnt >= 0x18) ? ENT_FLG_TRIGRICK : 0;
+                                int defaultFlags = (st.selectedEnt >= 0x18 && st.selectedEnt != 77) ? ENT_FLG_TRIGRICK : 0;
                                 if (st.selectedEnt == 39)
                                     defaultFlags |= ENT_FLG_LETHALI;
                                 if (st.selectedEnt == 25 || st.selectedEnt == 26 || st.selectedEnt == 32)
@@ -1269,6 +1364,14 @@ int main(int argc, char *argv[])
                                     defaultFlags |= ENT_FLG_ONCE | ENT_FLG_LETHALI;
                                 if (st.selectedEnt == 69)
                                     defaultFlags |= ENT_FLG_STOPRICK;
+                                if (st.selectedEnt == 50 || st.selectedEnt == 51 || st.selectedEnt == 52 || st.selectedEnt == 74)
+                                    defaultFlags |= ENT_FLG_LETHALI; // barrels: lethal from wake-up
+                                if (st.selectedEnt == 59 || st.selectedEnt == 64)
+                                    defaultFlags |= ENT_FLG_LETHALI | ENT_FLG_LETHALR; // flames: lethal wake + loop
+                                if (st.selectedEnt == 63)
+                                    defaultFlags |= ENT_FLG_LETHALI | ENT_FLG_LETHALR; // missile: lethal wake + loop
+                                if (st.selectedEnt == 48)
+                                    defaultFlags = 0x10 | ENT_FLG_ONCE | ENT_FLG_LETHALR; // lethal rock: Bomb + Once + LethalLoop
                                 sprites.marks[owner].push_back(MarkEntry{snappedRow, tileCol, fineY, st.selectedEnt, defaultFlags, tileCol, 0});
                                 st.dirty = true;
                             }
@@ -1437,6 +1540,8 @@ int main(int argc, char *argv[])
                 }
                 else if (ctrl && event.key.keysym.sym == SDLK_v && st.clip.hasData && st.canvasMode == CanvasMode::Block)
                     st.pasting = !st.pasting;
+                else if (ctrl && event.key.keysym.sym == SDLK_s && !event.key.repeat)
+                    doSave(st, fileDialog, connections, sprites, eflg, mapTexts);
                 else switch (event.key.keysym.sym)
                 {
                     case SDLK_ESCAPE:
@@ -1454,7 +1559,7 @@ int main(int argc, char *argv[])
                         clearSelection(st, st.selectedBlock);
                         break;
                     case SDLK_s:
-                        if (!event.key.repeat)
+                        if (!event.key.repeat && !(event.key.keysym.mod & (KMOD_CTRL | KMOD_ALT)))
                             st.canvasMode = (st.canvasMode == CanvasMode::Sprite) ? CanvasMode::Block : CanvasMode::Sprite;
                         break;
                     case SDLK_g:
@@ -1531,12 +1636,14 @@ int main(int argc, char *argv[])
                             if (ImGui::MenuItem(label.c_str()))
                             {
                                 std::string err;
-                                if (loadMapFileWithSprites(st.recentFiles[i], connections, sprites, eflg, mapTexts, err))
+                                if (loadMapFileWithSprites(st.recentFiles[i], connections, sprites, eflg, mapTexts, err, &st.ruxp))
                                 {
                                     st.currentPath = st.recentFiles[i]; st.dirty = false; st.sel.active = false;
+                                    if (!st.ruxp) st.bank = std::min(st.bank, LAST_USABLE_BANK);
                                     rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 0);
                                     rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 1);
                                     rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 2);
+                                    rebuildUnifiedTileAtlases(renderer, tileAtlasUni, blockAtlasUni);
                                     rebuildSpriteAtlas(renderer, spriteAtlas);
                                     int vw, vh; SDL_GetRendererOutputSize(renderer, &vw, &vh);
                                     const MapStartInfo &ms0 = connections.mapStarts[0];
@@ -1552,6 +1659,14 @@ int main(int argc, char *argv[])
                 }
                 if (ImGui::MenuItem("Save", "Ctrl+S")) doSave(st, fileDialog, connections, sprites, eflg, mapTexts);
                 if (ImGui::MenuItem("Save As...")) requestSaveAs(fileDialog, st.currentPath);
+                ImGui::Separator();
+                if (ImGui::MenuItem("Use Rick Ultra Xpanded Features", nullptr, st.ruxp))
+                {
+                    if (!st.ruxp) { st.confirmEnableRuxp = true; ImGui::OpenPopup("Enable Rick Ultra Xpanded Features?"); }
+                    else { st.ruxp = false; st.dirty = true; st.bank = std::min(st.bank, LAST_USABLE_BANK);
+                            tileEditor.bank = std::min(tileEditor.bank, LAST_USABLE_BANK);
+                            blockEditor.bank = std::min(blockEditor.bank, LAST_USABLE_BANK); } // turning RUxF off marks the map for a legacy save
+                }
                 ImGui::Separator();
                 if (ImGui::MenuItem("Patch xrick binary..."))
                 {
@@ -1612,6 +1727,8 @@ int main(int argc, char *argv[])
             }
             if (ImGui::BeginMenu("View"))
             {
+                ImGui::MenuItem("View Tools", nullptr, &st.showToolsPanel);
+                ImGui::Separator();
                 ImGui::MenuItem("Trigger boxes", nullptr, &st.showTriggerBoxes);
                 ImGui::MenuItem("Map start positions", nullptr, &st.showMapStartPositions);
                 ImGui::EndMenu();
@@ -1690,12 +1807,19 @@ int main(int argc, char *argv[])
             wrap();
 
             divider();
-            ImGui::TextDisabled("Bank");
-            for (int b = FIRST_USABLE_BANK; b <= LAST_USABLE_BANK; b++)
+            if (!st.ruxp)
             {
-                ImGui::SameLine();
-                char label[16]; std::snprintf(label, sizeof label, "%d##tb", b);
-                if (ImGui::RadioButton(label, st.bank == b)) st.bank = b;
+                // In legacy the canvas needs an active tile bank to
+                // render map_blocks' 0-255 tile indices; in RUxF the
+                // blocks carry absolute tile indices and render via the
+                // unified atlas, so no bank selector is needed.
+                ImGui::TextDisabled("Bank");
+                for (int b = FIRST_USABLE_BANK; b <= LAST_USABLE_BANK; b++)
+                {
+                    ImGui::SameLine();
+                    char label[16]; std::snprintf(label, sizeof label, "%d##tb", b);
+                    if (ImGui::RadioButton(label, st.bank == b)) st.bank = b;
+                }
             }
             wrap();
 
@@ -1777,18 +1901,20 @@ int main(int argc, char *argv[])
             switch (fileDialog.purpose)
             {
                 case DialogPurpose::SaveMap:
-                    if (saveMapFileWithSprites(chosenPath, connections, sprites, eflg, mapTexts, err)) { st.currentPath = chosenPath; st.dirty = false; st.addRecentFile(chosenPath); saveConfig(st, fileDialog); }
+                    if (saveMapFileWithSprites(chosenPath, connections, sprites, eflg, mapTexts, st.ruxp, err)) { st.currentPath = chosenPath; st.dirty = false; st.addRecentFile(chosenPath); saveConfig(st, fileDialog); }
                     else fileDialog.error = err;
                     break;
                 case DialogPurpose::OpenMap:
-                    if (loadMapFileWithSprites(chosenPath, connections, sprites, eflg, mapTexts, err))
+                    if (loadMapFileWithSprites(chosenPath, connections, sprites, eflg, mapTexts, err, &st.ruxp))
                     {
                         st.currentPath = chosenPath; st.dirty = false; st.sel.active = false;
+                        if (!st.ruxp) st.bank = std::min(st.bank, LAST_USABLE_BANK);
                         st.addRecentFile(chosenPath);
                         saveConfig(st, fileDialog);
                         rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 0);
                         rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 1);
                         rebuildBankAtlases(renderer, tileAtlas, blockAtlas, 2);
+                        rebuildUnifiedTileAtlases(renderer, tileAtlasUni, blockAtlasUni);
                         rebuildSpriteAtlas(renderer, spriteAtlas);
                         // Center on map start position 1
                         int vw, vh; SDL_GetRendererOutputSize(renderer, &vw, &vh);
@@ -1800,6 +1926,23 @@ int main(int argc, char *argv[])
                     break;
                 case DialogPurpose::PickXrickBinary:
                 {
+                    // If this map uses Rick Ultra Xpanded features, it can only
+                    // be patched into the modified (64-bit) RUxP xrick build --
+                    // the original executable only knows entity ids 0-73.
+                    if (st.ruxp)
+                    {
+                        std::string derr;
+                        if (!xrickSupportsRuxp(chosenPath, derr))
+                        {
+                            patchResultMessage =
+                                "This map uses Rick Ultra Xpanded Features (entity ids 74+).\n"
+                                "It cannot be patched into the original xrick executable --\n"
+                                "you must use the modified 64-bit RUxF xrick build.\n\n" + derr;
+                            patchResultOk = false;
+                            ImGui::OpenPopup("Result");
+                            break;
+                        }
+                    }
                     // Encode ASCII text screens before patching
                     std::vector<std::vector<uint8_t>> textEncoded(3);
                     std::vector<std::pair<const char*, size_t>> textSlots;
@@ -1852,6 +1995,7 @@ int main(int argc, char *argv[])
                     if (ok)
                     {
                         rebuildBankAtlases(renderer, tileAtlas, blockAtlas, tileEditor.bank);
+                        if (st.ruxp) rebuildUnifiedTileAtlases(renderer, tileAtlasUni, blockAtlasUni);
                         st.dirty = true; // tile graphics are part of the .map file now (RKM6) -- flag for save
                         patchResultMessage = "Imported " + chosenPath.filename().string() + " into tile "
                             + std::to_string(tileEditor.selectedTile) + " (bank " + std::to_string(tileEditor.bank) + ").";
@@ -1871,6 +2015,7 @@ int main(int argc, char *argv[])
                         if (br.imported > 0)
                         {
                             rebuildBankAtlases(renderer, tileAtlas, blockAtlas, tileEditor.bank);
+                            if (st.ruxp) rebuildUnifiedTileAtlases(renderer, tileAtlasUni, blockAtlasUni);
                             st.dirty = true;
                         }
                         std::string msg = "Batch import from " + chosenPath.filename().string() + ": detected a "
@@ -2090,8 +2235,44 @@ int main(int argc, char *argv[])
             ImGui::EndPopup();
         }
 
+        if (st.confirmEnableRuxp)
+        {
+            ImGui::OpenPopup("Enable Rick Ultra Xpanded Features?");
+            ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+            ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        }
+        if (ImGui::BeginPopupModal("Enable Rick Ultra Xpanded Features?", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+        {
+            ImGui::PushTextWrapPos(460.0f);
+            ImGui::TextUnformatted(
+                "This enables the Rick Ultra Xpanded Features:\n\n"
+                "  - New entities (75/76 now, more coming)\n"
+                "  - 1024 tiles and blocks with their flags,\n"
+                "    split across 4 pages in the UI\n\n"
+                "IMPORTANT: a map saved with these features is NOT compatible\n"
+                "with the original xrick executable. It can only be patched\n"
+                "into the modified (64-bit) xrick build, not the stock one.\n\n"
+                "The new options become available in the interface.");
+            ImGui::PopTextWrapPos();
+            ImGui::Separator();
+            if (ImGui::Button("Enable RUxF", ImVec2(140, 0)))
+            {
+                st.ruxp = true;
+                st.confirmEnableRuxp = false;
+                st.dirty = true; // the map's format marker changed; needs a save
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(120, 0)))
+            {
+                st.confirmEnableRuxp = false;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+
         // --- Block palette -- only relevant (and shown) in Block mode ---
-        if (st.canvasMode == CanvasMode::Block)
+        if (st.showToolsPanel && st.canvasMode == CanvasMode::Block)
         {
             ImGui::SetNextWindowPos(toolPanelPos);
             ImGui::SetNextWindowSize(toolPanelSize);
@@ -2099,7 +2280,29 @@ int main(int argc, char *argv[])
             ImGui::Text("Selected block: %d", st.selectedBlock);
             ImGui::Separator();
 
-            ImTextureID atlasTexId = (ImTextureID)(intptr_t)blockAtlas[st.bank];
+            // RUxF pages the 1024-block unified space 4 pages of 256 and
+            // previews from the unified block atlas; legacy shows the
+            // active bank's 256 blocks.
+            int blocksPerRow = st.ruxp ? UNI_BLOCKS_PER_ROW : ATLAS_BLOCKS_PER_ROW;
+            int blockBase = 0, blockCount = 0x100;
+            ImTextureID atlasTexId;
+            if (st.ruxp)
+            {
+                if (ImGui::RadioButton("P1", st.blockPage == 0)) st.blockPage = 0; ImGui::SameLine();
+                if (ImGui::RadioButton("P2", st.blockPage == 1)) st.blockPage = 1; ImGui::SameLine();
+                if (ImGui::RadioButton("P3", st.blockPage == 2)) st.blockPage = 2; ImGui::SameLine();
+                if (ImGui::RadioButton("P4", st.blockPage == 3)) st.blockPage = 3;
+                ImGui::Separator();
+                blockBase = st.blockPage * 0x100;
+                blockCount = 0x100;
+                atlasTexId = (ImTextureID)(intptr_t)blockAtlasUni;
+            }
+            else
+            {
+                blockBase = 0;
+                blockCount = 0x100;
+                atlasTexId = (ImTextureID)(intptr_t)blockAtlas[st.bank];
+            }
             float thumb = 40.0f;
             // Robust wrapping: decide whether to continue the row AFTER
             // placing each button, based on where it actually landed,
@@ -2112,13 +2315,14 @@ int main(int argc, char *argv[])
             // sprite quick-pick chips and the flags checkboxes.
             ImGuiStyle &blkStyle = ImGui::GetStyle();
             float blkWindowRight = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
-            for (int b = 0; b < 0x100; b++)
+            for (int i = 0; i < blockCount; i++)
             {
+                int b = blockBase + i;
                 ImGui::PushID(b);
-                float u0 = (float)(b % ATLAS_BLOCKS_PER_ROW) / ATLAS_BLOCKS_PER_ROW;
-                float v0 = (float)(b / ATLAS_BLOCKS_PER_ROW) / ATLAS_BLOCKS_PER_ROW;
-                float u1 = u0 + 1.0f / ATLAS_BLOCKS_PER_ROW;
-                float v1 = v0 + 1.0f / ATLAS_BLOCKS_PER_ROW;
+                float u0 = (float)(b % blocksPerRow) / blocksPerRow;
+                float v0 = (float)(b / blocksPerRow) / blocksPerRow;
+                float u1 = u0 + 1.0f / blocksPerRow;
+                float v1 = v0 + 1.0f / blocksPerRow;
 
                 bool selected = (b == st.selectedBlock);
                 if (selected) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.55f, 0.95f, 1.0f));
@@ -2127,7 +2331,7 @@ int main(int argc, char *argv[])
                 if (selected) ImGui::PopStyleColor();
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("Block %d", b);
                 float nextRight = ImGui::GetItemRectMax().x + blkStyle.ItemSpacing.x + ImGui::GetItemRectSize().x;
-                if (b != 255 && nextRight < blkWindowRight)
+                if (i != blockCount - 1 && nextRight < blkWindowRight)
                     ImGui::SameLine();
                 ImGui::PopID();
             }
@@ -2145,7 +2349,7 @@ int main(int argc, char *argv[])
             ImGui::SetNextWindowSize(ImVec2(560, 520), ImGuiCond_FirstUseEver);
             ImGui::Begin("Tile Editor", &tileEditor.open);
 
-            ImGui::Text("Tile bank:");
+            ImGui::Text("Tile page:");
             ImGui::SameLine();
             {
                 char label0[24]; std::snprintf(label0, sizeof label0, "0 (font/decor)##tebank0");
@@ -2156,7 +2360,7 @@ int main(int argc, char *argv[])
                                                             "below). Hidden from Block Palette/Block Editor since "
                                                             "no block ever uses it in-game.");
             ImGui::SameLine();
-            for (int b = FIRST_USABLE_BANK; b <= LAST_USABLE_BANK; b++)
+            for (int b = FIRST_USABLE_BANK; b <= (st.ruxp ? RUxF_GAME_PAGES : LAST_USABLE_BANK); b++)
             {
                 ImGui::SameLine();
                 char label[16]; std::snprintf(label, sizeof label, "%d##tebank", b);
@@ -2300,6 +2504,7 @@ int main(int argc, char *argv[])
                                     else if (map_blocks[bl][s] == b) map_blocks[bl][s] = a;
                                 }
                             rebuildBankAtlases(renderer, tileAtlas, blockAtlas, bank);
+                            if (st.ruxp) rebuildUnifiedTileAtlases(renderer, tileAtlasUni, blockAtlasUni);
                             tileEditor.swapMode = false;
                             tileEditor.selectedTile = b;
                         }
@@ -2308,6 +2513,7 @@ int main(int argc, char *argv[])
                             int bank = tileEditor.bank;
                             std::memcpy(tiles_data[bank][t], tileEditor.copiedTile, sizeof(tile_t));
                             rebuildBankAtlases(renderer, tileAtlas, blockAtlas, bank);
+                            if (st.ruxp) rebuildUnifiedTileAtlases(renderer, tileAtlasUni, blockAtlasUni);
                             tileEditor.copyMode = false;
                             tileEditor.selectedTile = t;
                         }
@@ -2379,6 +2585,7 @@ int main(int argc, char *argv[])
                                     for (int y = 0; y < 8; y++)
                                         tiles_data[tileEditor.bank][t][y] = 0;
                                 rebuildBankAtlases(renderer, tileAtlas, blockAtlas, tileEditor.bank);
+                                if (st.ruxp) rebuildUnifiedTileAtlases(renderer, tileAtlasUni, blockAtlasUni);
                                 st.dirty = true;
                                 tileEditor.multiSelected.clear();
                                 tileEditor.selectedTile = -1;
@@ -2450,6 +2657,7 @@ int main(int argc, char *argv[])
                         for (int y = 0; y < 8; y++)
                             tiles_data[tileEditor.bank][tileEditor.selectedTile][y] = 0;
                         rebuildBankAtlases(renderer, tileAtlas, blockAtlas, tileEditor.bank);
+                        if (st.ruxp) rebuildUnifiedTileAtlases(renderer, tileAtlasUni, blockAtlasUni);
                         st.dirty = true;
                     }
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Set all pixels of this tile to black (color 0)");
@@ -2566,7 +2774,10 @@ int main(int argc, char *argv[])
                                 setSpritePixel(sprites_data[pixelEditor.index], x, y, pixelEditor.color);
                             st.dirty = true;
                             if (pixelEditor.target == PixelEditorState::Tile)
+                            {
                                 rebuildBankAtlases(renderer, tileAtlas, blockAtlas, pixelEditor.bank);
+                                if (st.ruxp) rebuildUnifiedTileAtlases(renderer, tileAtlasUni, blockAtlasUni);
+                            }
                             else
                                 rebuildSpriteAtlas(renderer, spriteAtlas);
                         }
@@ -2578,7 +2789,10 @@ int main(int argc, char *argv[])
                                 setSpritePixel(sprites_data[pixelEditor.index], x, y, pixelEditor.color);
                             st.dirty = true;
                             if (pixelEditor.target == PixelEditorState::Tile)
+                            {
                                 rebuildBankAtlases(renderer, tileAtlas, blockAtlas, pixelEditor.bank);
+                                if (st.ruxp) rebuildUnifiedTileAtlases(renderer, tileAtlasUni, blockAtlasUni);
+                            }
                             else
                                 rebuildSpriteAtlas(renderer, spriteAtlas);
                         }
@@ -2631,11 +2845,11 @@ int main(int argc, char *argv[])
             if (ImGui::Button("Cancel", ImVec2(80, 0)))
             {
                 if (pixelEditor.target == PixelEditorState::Tile)
+                {
                     std::memcpy(tiles_data[pixelEditor.bank][pixelEditor.index], pixelEditor.backupTile, sizeof(tile_t));
-                else
-                    std::memcpy(sprites_data[pixelEditor.index], pixelEditor.backupSprite, sizeof(sprite_t));
-                if (pixelEditor.target == PixelEditorState::Tile)
                     rebuildBankAtlases(renderer, tileAtlas, blockAtlas, pixelEditor.bank);
+                    if (st.ruxp) rebuildUnifiedTileAtlases(renderer, tileAtlasUni, blockAtlasUni);
+                }
                 else
                     rebuildSpriteAtlas(renderer, spriteAtlas);
                 st.dirty = true;
@@ -2655,16 +2869,33 @@ int main(int argc, char *argv[])
             ImGui::SetNextWindowSize(ImVec2(700, 560), ImGuiCond_FirstUseEver);
             ImGui::Begin("Block Editor", &blockEditor.open);
 
-            ImGui::Text("Preview bank:");
-            ImGui::SameLine();
-            for (int b = FIRST_USABLE_BANK; b <= LAST_USABLE_BANK; b++)
+            // RUxF pages the 1024 shared blocks 4 pages of 256; legacy
+            // has a single 256-block page ("Preview bank" is only about
+            // which tile bank's graphics preview the composition).
+            if (st.ruxp)
             {
-                if (b > FIRST_USABLE_BANK) ImGui::SameLine();
-                char label[16]; std::snprintf(label, sizeof label, "%d##bebank", b);
-                if (ImGui::RadioButton(label, blockEditor.bank == b)) blockEditor.bank = b;
+                ImGui::Text("Block page:");
+                ImGui::SameLine();
+                for (int p = 0; p < RUxF_GAME_PAGES; p++)
+                {
+                    if (p > 0) ImGui::SameLine();
+                    char label[16]; std::snprintf(label, sizeof label, "%d##bepage", p + 1);
+                    if (ImGui::RadioButton(label, blockEditor.blockPage == p)) blockEditor.blockPage = p;
+                }
             }
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Block composition is shared by both banks -- this only "
-                                                            "picks which bank's tile graphics preview here");
+            else
+            {
+                ImGui::Text("Preview bank:");
+                ImGui::SameLine();
+                for (int b = FIRST_USABLE_BANK; b <= LAST_USABLE_BANK; b++)
+                {
+                    if (b > FIRST_USABLE_BANK) ImGui::SameLine();
+                    char label[16]; std::snprintf(label, sizeof label, "%d##bebank", b);
+                    if (ImGui::RadioButton(label, blockEditor.bank == b)) blockEditor.bank = b;
+                }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Block composition is shared by both banks -- this only "
+                                                                "picks which bank's tile graphics preview here");
+            }
             ImGui::Separator();
 
             ImGui::Separator();
@@ -2678,17 +2909,25 @@ int main(int argc, char *argv[])
             float detailW = 280.0f;
             ImGui::BeginChild("##blockGrid", ImVec2(-detailW, 0), true);
             {
-                ImTextureID blkTexId = (ImTextureID)(intptr_t)blockAtlas[blockEditor.bank];
+                // RUxF shows the 256 blocks on the selected page of the
+                // unified 1024-block space via the unified atlas; legacy
+                // shows the active bank's 256 blocks.
+                int blocksPerRow = st.ruxp ? UNI_BLOCKS_PER_ROW : ATLAS_BLOCKS_PER_ROW;
+                int blockBase = st.ruxp ? blockEditor.blockPage * 0x100 : 0;
+                ImTextureID blkTexId = st.ruxp
+                    ? (ImTextureID)(intptr_t)blockAtlasUni
+                    : (ImTextureID)(intptr_t)blockAtlas[blockEditor.bank];
                 float thumb = 40.0f;
                 ImGuiStyle &beStyle = ImGui::GetStyle();
                 float beWindowRight = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
-                for (int b = 0; b < 0x100; b++)
+                for (int i = 0; i < 0x100; i++)
                 {
+                    int b = blockBase + i;
                     ImGui::PushID(b);
-                    float u0 = (float)(b % ATLAS_BLOCKS_PER_ROW) / ATLAS_BLOCKS_PER_ROW;
-                    float v0 = (float)(b / ATLAS_BLOCKS_PER_ROW) / ATLAS_BLOCKS_PER_ROW;
-                    float u1 = u0 + 1.0f / ATLAS_BLOCKS_PER_ROW;
-                    float v1 = v0 + 1.0f / ATLAS_BLOCKS_PER_ROW;
+                    float u0 = (float)(b % blocksPerRow) / blocksPerRow;
+                    float v0 = (float)(b / blocksPerRow) / blocksPerRow;
+                    float u1 = u0 + 1.0f / blocksPerRow;
+                    float v1 = v0 + 1.0f / blocksPerRow;
 
                     // Whether a style color was pushed for THIS button is
                     // captured up front and used as-is for the matching
@@ -2721,6 +2960,7 @@ int main(int argc, char *argv[])
                                 }
                                 rebuildBlockAtlasOnly(renderer, tileAtlas, blockAtlas, 1);
                                 rebuildBlockAtlasOnly(renderer, tileAtlas, blockAtlas, 2);
+                                if (st.ruxp) rebuildUnifiedBlockAtlas(renderer, tileAtlasUni, blockAtlasUni);
                                 st.dirty = true;
                             }
                             blockEditor.swapMode = false;
@@ -2732,6 +2972,7 @@ int main(int argc, char *argv[])
                                 std::memcpy(map_blocks[b], map_blocks[blockEditor.selectedBlock], sizeof(map_blocks[b]));
                                 rebuildBlockAtlasOnly(renderer, tileAtlas, blockAtlas, 1);
                                 rebuildBlockAtlasOnly(renderer, tileAtlas, blockAtlas, 2);
+                                if (st.ruxp) rebuildUnifiedBlockAtlas(renderer, tileAtlasUni, blockAtlasUni);
                                 st.dirty = true;
                             }
                             blockEditor.selectedBlock = b;
@@ -2752,7 +2993,7 @@ int main(int argc, char *argv[])
                         else ImGui::SetTooltip("Block %d", b);
                     }
                     float nextRight = ImGui::GetItemRectMax().x + beStyle.ItemSpacing.x + ImGui::GetItemRectSize().x;
-                    if (b != 255 && nextRight < beWindowRight)
+                    if (i != 255 && nextRight < beWindowRight)
                         ImGui::SameLine();
                     ImGui::PopID();
                 }
@@ -2768,38 +3009,44 @@ int main(int argc, char *argv[])
                 }
                 else
                 {
-                    ImGui::Text("Block %d (bank %d preview)", blockEditor.selectedBlock, blockEditor.bank);
+                    ImGui::Text("Block %d", blockEditor.selectedBlock);
                     ImGui::TextWrapped("Click a cell below, then click a tile to place it there.");
                     ImGui::Spacing();
 
                     // 4x4 editable grid: cell i is column i%4, row i/4
                     // (same layout as build_block_atlas()/drawblock()).
-                    ImTextureID tileTexId = (ImTextureID)(intptr_t)tileAtlas[blockEditor.bank];
+                    const int tilesPerRow = st.ruxp ? UNI_TILES_PER_ROW : ATLAS_TILES_PER_ROW;
+                    const int tileCap = st.ruxp ? RUxF_GAME_TILES - 1 : 255;
+                    ImTextureID tileTexId = st.ruxp
+                        ? (ImTextureID)(intptr_t)tileAtlasUni
+                        : (ImTextureID)(intptr_t)tileAtlas[blockEditor.bank];
                     float cell = 48.0f;
                     int *cells = map_blocks[blockEditor.selectedBlock];
                     bool blockChanged = false;
                     for (int i = 0; i < 16; i++)
                     {
                         ImGui::PushID(i);
-                        int t = std::clamp(cells[i], 0, 255);
-                        float u0 = (float)(t % ATLAS_TILES_PER_ROW) / ATLAS_TILES_PER_ROW;
-                        float v0 = (float)(t / ATLAS_TILES_PER_ROW) / ATLAS_TILES_PER_ROW;
-                        float u1 = u0 + 1.0f / ATLAS_TILES_PER_ROW;
-                        float v1 = v0 + 1.0f / ATLAS_TILES_PER_ROW;
+                        int t = std::clamp(cells[i], 0, tileCap);
+                        float u0 = (float)(t % tilesPerRow) / tilesPerRow;
+                        float v0 = (float)(t / tilesPerRow) / tilesPerRow;
+                        float u1 = u0 + 1.0f / tilesPerRow;
+                        float v1 = v0 + 1.0f / tilesPerRow;
 
                         bool selected = (i == blockEditor.selectedCell);
                         if (selected) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.55f, 0.95f, 1.0f));
                         if (ImGui::ImageButton("##cell", tileTexId, ImVec2(cell, cell), ImVec2(u0, v0), ImVec2(u1, v1)))
                             blockEditor.selectedCell = i;
                     if (selected || tileEditor.swapMode) ImGui::PopStyleColor();
-                        drawTileHazardBorder(ImGui::GetWindowDrawList(), ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), eflg.bank[blockEditor.bank - 1][t]);
+                        drawTileHazardBorder(ImGui::GetWindowDrawList(), ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+                                             st.ruxp ? eflg.bank[t / RUxF_PAGE_TILES][t % RUxF_PAGE_TILES]
+                                                     : eflg.bank[blockEditor.bank - 1][t]);
                         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Cell %d (tile %d)", i, t);
                         if (i % 4 != 3) ImGui::SameLine();
                         ImGui::PopID();
                     }
 
                     ImGui::Spacing();
-                    ImGui::Text("Selected cell: %d (tile %d)", blockEditor.selectedCell, std::clamp(cells[blockEditor.selectedCell], 0, 255));
+                    ImGui::Text("Selected cell: %d (tile %d)", blockEditor.selectedCell, std::clamp(cells[blockEditor.selectedCell], 0, tileCap));
                     // These 3 buttons can together exceed this panel's
                     // fixed width (280px, or narrower still if the user
                     // shrinks the window) -- SameLine() alone doesn't
@@ -2838,23 +3085,46 @@ int main(int argc, char *argv[])
                                                                    "(this block itself is left unchanged)");
 
                     ImGui::Separator();
-                    ImGui::TextWrapped("Tile picker (bank %d) -- click to place into the selected cell:", blockEditor.bank);
+                    if (st.ruxp)
+                    {
+                        ImGui::TextWrapped("Tile picker -- click a tile to place into the selected cell (absolute 0-1023):");
+                        ImGui::Text("Tile page:");
+                        ImGui::SameLine();
+                        for (int p = 0; p < RUxF_GAME_PAGES; p++)
+                        {
+                            if (p > 0) ImGui::SameLine();
+                            char l[16]; std::snprintf(l, sizeof l, "%d##bepick", p + 1);
+                            if (ImGui::RadioButton(l, blockEditor.pickPage == p)) blockEditor.pickPage = p;
+                        }
+                        ImGui::Separator();
+                    }
+                    else
+                    {
+                        ImGui::TextWrapped("Tile picker (bank %d) -- click to place into the selected cell:", blockEditor.bank);
+                    }
                     ImGui::BeginChild("##blockTilePicker", ImVec2(0, 0), true);
                     {
+                        const int tilesPerRowP = st.ruxp ? UNI_TILES_PER_ROW : ATLAS_TILES_PER_ROW;
+                        const int tileCapP = st.ruxp ? RUxF_GAME_TILES - 1 : 255;
+                        ImTextureID pickTexId = st.ruxp
+                            ? (ImTextureID)(intptr_t)tileAtlasUni
+                            : (ImTextureID)(intptr_t)tileAtlas[blockEditor.bank];
+                        const int pickBase = st.ruxp ? blockEditor.pickPage * RUxF_PAGE_TILES : 0;
                         float thumb2 = 28.0f;
                         ImGuiStyle &tpStyle = ImGui::GetStyle();
                         float tpWindowRight = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
-                        for (int t = 0; t < 0x100; t++)
+                        for (int ti = 0; ti < 0x100; ti++)
                         {
+                            int t = pickBase + ti;
                             ImGui::PushID(t);
-                            float u0 = (float)(t % ATLAS_TILES_PER_ROW) / ATLAS_TILES_PER_ROW;
-                            float v0 = (float)(t / ATLAS_TILES_PER_ROW) / ATLAS_TILES_PER_ROW;
-                            float u1 = u0 + 1.0f / ATLAS_TILES_PER_ROW;
-                            float v1 = v0 + 1.0f / ATLAS_TILES_PER_ROW;
+                            float u0 = (float)(t % tilesPerRowP) / tilesPerRowP;
+                            float v0 = (float)(t / tilesPerRowP) / tilesPerRowP;
+                            float u1 = u0 + 1.0f / tilesPerRowP;
+                            float v1 = v0 + 1.0f / tilesPerRowP;
 
-                            bool isCurrent = (t == std::clamp(cells[blockEditor.selectedCell], 0, 255));
+                            bool isCurrent = (t == std::clamp(cells[blockEditor.selectedCell], 0, tileCapP));
                             if (isCurrent) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.55f, 0.95f, 1.0f));
-                            if (ImGui::ImageButton("##pick", tileTexId, ImVec2(thumb2, thumb2), ImVec2(u0, v0), ImVec2(u1, v1)))
+                            if (ImGui::ImageButton("##pick", pickTexId, ImVec2(thumb2, thumb2), ImVec2(u0, v0), ImVec2(u1, v1)))
                             {
                                 cells[blockEditor.selectedCell] = t;
                                 blockChanged = true;
@@ -2869,10 +3139,12 @@ int main(int argc, char *argv[])
                                 if (blockEditor.selectedCell < 15) blockEditor.selectedCell++;
                             }
                             if (isCurrent) ImGui::PopStyleColor();
-                            drawTileHazardBorder(ImGui::GetWindowDrawList(), ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), eflg.bank[blockEditor.bank - 1][t]);
+                            drawTileHazardBorder(ImGui::GetWindowDrawList(), ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+                                                 st.ruxp ? eflg.bank[t / RUxF_PAGE_TILES][t % RUxF_PAGE_TILES]
+                                                         : eflg.bank[blockEditor.bank - 1][t]);
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip(tileEditor.swapMode ? "Swap with tile %d" : "Tile %d", t);
                             float nextRight = ImGui::GetItemRectMax().x + tpStyle.ItemSpacing.x + ImGui::GetItemRectSize().x;
-                            if (t != 255 && nextRight < tpWindowRight)
+                            if (ti != 255 && nextRight < tpWindowRight)
                                 ImGui::SameLine();
                             ImGui::PopID();
                         }
@@ -2884,6 +3156,7 @@ int main(int argc, char *argv[])
                         st.dirty = true; // map_blocks is part of the .map file now (RKM7) -- flag for save
                         rebuildBlockAtlasOnly(renderer, tileAtlas, blockAtlas, 1);
                         rebuildBlockAtlasOnly(renderer, tileAtlas, blockAtlas, 2);
+                        if (st.ruxp) rebuildUnifiedBlockAtlas(renderer, tileAtlasUni, blockAtlasUni);
                     }
                 }
             }
@@ -3385,7 +3658,7 @@ int main(int argc, char *argv[])
         }
 
         // --- Screen Connections (links between submaps) -- only relevant (and shown) in Submap mode ---
-        if (st.canvasMode == CanvasMode::Submap)
+        if (st.showToolsPanel && st.canvasMode == CanvasMode::Submap)
         {
         ImGui::SetNextWindowPos(toolPanelPos);
         ImGui::SetNextWindowSize(toolPanelSize);
@@ -3396,11 +3669,17 @@ int main(int argc, char *argv[])
             bool full = totalSlots >= MAP_NBR_CONNECT;
             ImGui::TextColored(full ? ImVec4(1.0f, 0.6f, 0.3f, 1.0f) : ImVec4(0.7f, 0.9f, 0.7f, 1.0f),
                                 "%d / %d exit slots used", totalSlots, MAP_NBR_CONNECT);
-            ImGui::TextWrapped("Rows are absolute TILE rows -- four times finer than the main map's "
-                                "block grid (\"Cell under cursor\" in Tools), so e.g. row 60 here lines "
-                                "up with block row 15 there. Confirmed from the original xrick source. "
-                                "A link is one row on this submap connected to one row on the target "
-                                "(direction just says which way through it counts as a trigger).");
+            ImGui::TextWrapped(st.ruxp
+                ? "RUxF transitions: Rick walks left/right off this submap into the "
+                  "target submap. There is no trigger row (left/right exits trigger "
+                  "at the screen edge). For each link set the target submap, the "
+                  "arrival tile row (absolute), and the arrival tile column 0-31 "
+                  "(left edge ~0-3, right edge ~28-31; Rick lands centered)."
+                : "Rows are absolute TILE rows -- four times finer than the main map's "
+                  "block grid (\"Cell under cursor\" in Tools), so e.g. row 60 here lines "
+                  "up with block row 15 there. Confirmed from the original xrick source. "
+                  "A link is one row on this submap connected to one row on the target "
+                  "(direction just says which way through it counts as a trigger).");
             ImGui::Separator();
 
             // --- Per-map start positions (xrick's map_maps) ---
@@ -3541,7 +3820,14 @@ int main(int argc, char *argv[])
                     {
                         int lo = INT32_MAX, hi = INT32_MIN;
                         for (auto &m : sprites.marks[s]) { lo = std::min(lo, m.rowAbs); hi = std::max(hi, m.rowAbs); }
-                        for (auto &c : connections.exits[s]) { lo = std::min(lo, c.rowAbs); hi = std::max(hi, c.rowAbs); }
+                        for (auto &cx : connections.exits[s])
+                        {
+                            // In RUxF, the exit row stored/displayed in the
+                            // connector UI carries the +1 offset; show the
+                            // same logical row here for consistency.
+                            int exitRow = cx.rowAbs - (st.ruxp ? 1 : 0);
+                            lo = std::min(lo, exitRow); hi = std::max(hi, exitRow);
+                        }
                         if (lo <= hi)
                             ImGui::TextDisabled("Its own sprites/exits currently span rows %d-%d (%d rows) -- "
                                                  "not a stored value, just what's placed so far.", lo, hi, hi - lo + 1);
@@ -3549,10 +3835,13 @@ int main(int argc, char *argv[])
                             ImGui::TextDisabled("No sprites or exits placed in it yet.");
                     }
 
-                    int bank = connections.submaps[s].page; // 0 = tile bank 1, 1 = tile bank 2
-                    ImGui::SetNextItemWidth(90);
-                    if (ImGui::Combo("Tile bank", &bank, "1\0002\0\0")) connections.submaps[s].page = bank;
-                    ImGui::SameLine();
+                    if (!st.ruxp)
+                    {
+                        int bank = connections.submaps[s].page; // 0 = tile bank 1, 1 = tile bank 2
+                        ImGui::SetNextItemWidth(90);
+                        if (ImGui::Combo("Tile bank", &bank, "1\0002\0\0")) connections.submaps[s].page = bank;
+                        ImGui::SameLine();
+                    }
                     if (ImGui::SmallButton("Delete submap"))
                         ImGui::OpenPopup("confirm_delete_submap");
                     if (ImGui::BeginPopup("confirm_delete_submap"))
@@ -3573,6 +3862,84 @@ int main(int argc, char *argv[])
                     {
                         ImGui::PushID(e);
                         ConnectEntry &c = exits[e];
+
+                        if (st.ruxp)
+                        {
+                            // RUxF stores the connector rows with a +1 offset
+                            // relative to what the UI shows: the row the editor
+                            // reads off the map ("the level's own row numbers")
+                            // is one tile row below the connector value that
+                            // makes the engine teleport to that spot. The UI
+                            // shows stored-1 and any edit stores UI+1, so a
+                            // load/save round-trip stays stable.
+                            const int RUXF_ROW_OFFSET = 1;
+                            int uiRowOut = c.rowAbs - RUXF_ROW_OFFSET;
+                            int uiRowIn = c.targetRowAbs - RUXF_ROW_OFFSET;
+
+                            const char* ruxfDirLabels[] = { "Left", "Right" };
+                            ImGui::SetNextItemWidth(70);
+                            {
+                                int prevDir = c.dir;
+                                ImGui::Combo("##dir", &c.dir, ruxfDirLabels, 2);
+                                if (prevDir != c.dir && c.dir == 1 && c.col == 0)
+                                    c.col = 29;  // right-edge default arrival column
+                            }
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Direction Rick exits this submap (left/right edge).");
+                            ImGui::SameLine();
+                            ImGui::TextUnformatted("at tile row");
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(60);
+                            ImGui::DragInt("##rowout", &uiRowOut, 1.0f, 0, MAP_TILE_ROWS - 1);
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Exit tile row (absolute) at which this link triggers. "
+                                    "If several exits use the same direction, the engine picks the one "
+                                    "whose row is the first >= Rick's current row when he walks off the edge.");
+                            ImGui::SameLine();
+                            ImGui::TextUnformatted("->");
+                            ImGui::SameLine();
+                            int target = c.targetSubmap == SUBMAP_END_OF_LEVEL ? MAP_NBR_SUBMAPS : c.targetSubmap;
+                            ImGui::SetNextItemWidth(60);
+                            if (ImGui::DragInt("##target", &target, 1.0f, 0, MAP_NBR_SUBMAPS))
+                                c.targetSubmap = std::clamp(target, 0, MAP_NBR_SUBMAPS);
+                            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%d = end of this world", MAP_NBR_SUBMAPS);
+                            if (c.targetSubmap >= MAP_NBR_SUBMAPS) c.targetSubmap = SUBMAP_END_OF_LEVEL;
+                            ImGui::SameLine();
+                            if (ImGui::SmallButton("X")) removeIdx = e;
+
+                            if (c.targetSubmap != SUBMAP_END_OF_LEVEL)
+                            {
+                                ImGui::TextDisabled("   arrives at");
+                                ImGui::SameLine();
+                                ImGui::TextUnformatted("submap");
+                                ImGui::SameLine();
+                                ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "%d", target);
+                                ImGui::SameLine();
+                                ImGui::TextUnformatted("tile row");
+                                ImGui::SameLine();
+                                ImGui::SetNextItemWidth(60);
+                                ImGui::DragInt("##targetrowabs", &uiRowIn, 1.0f, 0, MAP_TILE_ROWS - 1);
+                                if (ImGui::IsItemHovered())
+                                    ImGui::SetTooltip("Absolute tile-row Rick arrives at in the target submap (his y pixel height is preserved).");
+                                ImGui::SameLine();
+                                ImGui::TextUnformatted("col");
+                                ImGui::SameLine();
+                                ImGui::SetNextItemWidth(45);
+                                ImGui::DragInt("##colin", &c.col, 0.2f, 0, 31);
+                                if (ImGui::IsItemHovered())
+                                    ImGui::SetTooltip("Arrival tile column 0-31 in the target submap (left edge ~0-3, right edge ~28-31).");
+                            }
+                            else
+                            {
+                                ImGui::TextDisabled("   (ends this world)");
+                            }
+
+                            // Commit UI edits back to the stored +1 value.
+                            c.rowAbs = uiRowOut + RUXF_ROW_OFFSET;
+                            c.targetRowAbs = uiRowIn + RUXF_ROW_OFFSET;
+                            ImGui::PopID();
+                            continue;
+                        }
 
                         int base = submapStartRow(connections.submaps[s]);
                         bool outOfRange = (c.rowAbs - base < 0 || c.rowAbs - base > 255);
@@ -3627,7 +3994,13 @@ int main(int argc, char *argv[])
                         if (!full)
                         {
                             int base = submapStartRow(connections.submaps[s]);
-                            exits.push_back(ConnectEntry{0, base, SUBMAP_END_OF_LEVEL, 0});
+                            // RUxF: arrive at this submap's own start row/col with an
+                            // end-of-world target; legacy: down-link from this submap's
+                            // start row to end-of-world.
+                            if (st.ruxp)
+                                exits.push_back(ConnectEntry{0, base, SUBMAP_END_OF_LEVEL, base, 0});
+                            else
+                                exits.push_back(ConnectEntry{0, base, SUBMAP_END_OF_LEVEL, 0});
                         }
                     }
                     ImGui::Unindent();
@@ -3647,7 +4020,7 @@ int main(int argc, char *argv[])
         }
 
         // --- Sprite Tools -- only relevant (and shown) in Sprite mode ---
-        if (st.canvasMode == CanvasMode::Sprite)
+        if (st.showToolsPanel && st.canvasMode == CanvasMode::Sprite)
         {
         ImGui::SetNextWindowPos(toolPanelPos);
         ImGui::SetNextWindowSize(toolPanelSize);
@@ -3656,38 +4029,52 @@ int main(int argc, char *argv[])
         ImGui::TextWrapped("Left click: place the selected entity. Right click: remove the nearest sprite.");
         ImGui::Separator();
         ImGui::SetNextItemWidth(100);
-        ImGui::DragInt("Entity type", &st.selectedEnt, 1.0f, 0, 255);
+        int entMax = st.ruxp ? (int)entDataTable.size() - 1 : st.maxLegacyEnt();
+        ImGui::DragInt("Entity type", &st.selectedEnt, 1.0f, 0, entMax);
         {
             // Quick-pick chips for all entity types that have a valid sprite.
             // Some groups of related traps are pulled out of numeric order
             // and shown side by side so they're easy to compare:
-            //   dogs (53 slow walker, 66 fast walker),
-            //     grouped together right after ent 38, with fire trap 64
-            //     following the group
-            //   grille traps (45, 49, 52)
+            //   dogs (53 slow walker, 66 fast walker), grouped together right
+            //     after ent 38
+            //   barrels / tonneaux (61, 51, 74, 50) grouped together,
+            //     between ent 38 and ent 42 (i.e. right after the moving
+            //     stones, whose block ends with ent 38), before the last block
+            //   flame traps (59, 64) grouped right after ent 39
+            //   grille traps (45, 49, 52) with lethal rock 48 right between
+            //     ent 52 and the moving stones (ent 24 first)
             //   moving stones / falling rocks (24, 28, 73, 31, 33, 36, 38)
             //   arrow trap 32 sits right after ent 26
-            //   fireball ball (42) and egyptian treasure (34, 35) always go last
+            //   sound trigger 43 sits between fireball ball 42 and the
+            //     egyptian treasure (34, 35); the cranes 69, 60 come after
+            //     ent 35 -- this whole last block (42, 43, 34, 35, 69, 60)
+            //     ends the list
+            const int barrelEnts[] = {61, 51, 74, 50};
             const int dogEnts[] = {53, 66};
-            const int afterDogsEnts[] = {64};
-            const int grilleEnts[] = {45, 49, 52};
+            const int after39Ents[] = {59, 64};
+            const int grilleEnts[] = {45, 49, 52, 48};
             const int stoneEnts[] = {24, 28, 73, 31, 33, 36, 38};
-            const int lastEnts[] = {42, 34, 35};
+            const int lastEnts[] = {42, 43, 34, 35, 69, 60};
+            const int slowClones[] = {75, 76};  // inserted next to their originals
             const int after23Ents[] = {47};  // sound trigger sits next to ent 23
             const int after26Ents[] = {32};  // vertical arrow trap sits after ent 26
+            const int after21Ents[] = {77};  // RUxF life bonus sits between ent 21 and 22
             std::vector<int> all;
             for (int e = 0; e < (int)entDataTable.size(); e++)
             {
                 bool grouped = false;
+                for (int g : barrelEnts) if (g == e) grouped = true;
                 for (int g : dogEnts) if (g == e) grouped = true;
-                for (int g : afterDogsEnts) if (g == e) grouped = true;
+                for (int g : after39Ents) if (g == e) grouped = true;
                 for (int g : grilleEnts) if (g == e) grouped = true;
                 for (int g : stoneEnts) if (g == e) grouped = true;
                 for (int g : lastEnts) if (g == e) grouped = true;
+                for (int g : slowClones) if (g == e) grouped = true;
                 for (int g : after23Ents) if (g == e) grouped = true;
                 for (int g : after26Ents) if (g == e) grouped = true;
+                for (int g : after21Ents) if (g == e) grouped = true;
                 if (grouped) continue;
-                if (entDataTable[e].h > 0 && entDataTable[e].spr < SPRITES_NBR_SPRITES)
+                if (entDataTable[e].h > 0 && entDataTable[e].spr < SPRITES_NBR_SPRITES && (st.ruxp || e <= st.maxLegacyEnt()))
                     all.push_back(e);
             }
             // Insert ent 47 (sound trigger) right after ent 23.
@@ -3702,23 +4089,53 @@ int main(int argc, char *argv[])
             for (int g : after26Ents)
                 if (entDataTable[g].h > 0 && entDataTable[g].spr < SPRITES_NBR_SPRITES)
                     all.insert(pos32, g);
-            // Insert the dog group (and fire trap 64 after it) right after ent 38.
-            auto it38 = std::find(all.begin(), all.end(), 38);
-            auto posDogs = it38 != all.end() ? it38 + 1 : all.end();
-            std::vector<int> dogBlock;
-            for (int d : dogEnts)
-                if (entDataTable[d].h > 0 && entDataTable[d].spr < SPRITES_NBR_SPRITES)
-                    dogBlock.push_back(d);
-            for (int d : afterDogsEnts)
-                if (entDataTable[d].h > 0 && entDataTable[d].spr < SPRITES_NBR_SPRITES)
-                    dogBlock.push_back(d);
-            all.insert(posDogs, dogBlock.begin(), dogBlock.end());
+            // Insert flame traps (59, 64) right after ent 39.
+            auto it39 = std::find(all.begin(), all.end(), 39);
+            auto posFlames = it39 != all.end() ? it39 + 1 : all.end();
+            std::vector<int> flameBlock;
+            for (int f : after39Ents)
+                if (entDataTable[f].h > 0 && entDataTable[f].spr < SPRITES_NBR_SPRITES)
+                    flameBlock.push_back(f);
+            all.insert(posFlames, flameBlock.begin(), flameBlock.end());
+            // Slow clones: ent 75 right after its original 57, and ent 76
+            // right after its original 63 (RUxP entities only).
+            if (st.ruxp)
+            {
+                auto it57 = std::find(all.begin(), all.end(), 57);
+                auto pos75 = it57 != all.end() ? it57 + 1 : all.end();
+                if (entDataTable[75].h > 0 && entDataTable[75].spr < SPRITES_NBR_SPRITES)
+                    all.insert(pos75, 75);
+                auto it63 = std::find(all.begin(), all.end(), 63);
+                auto pos76 = it63 != all.end() ? it63 + 1 : all.end();
+                if (entDataTable[76].h > 0 && entDataTable[76].spr < SPRITES_NBR_SPRITES)
+                    all.insert(pos76, 76);
+                // RUxF life bonus (77) sits right after ent 21, between it
+                // and ent 22.
+                auto it21 = std::find(all.begin(), all.end(), 21);
+                auto pos77 = it21 != all.end() ? it21 + 1 : all.end();
+                if (entDataTable[77].h > 0 && entDataTable[77].spr < SPRITES_NBR_SPRITES)
+                    all.insert(pos77, 77);
+            }
+            // Grille traps + lethal rock: 45, 49, 52, then 48 (48 sits
+            // between the grilles and the moving stones starting with 24).
             for (int g : grilleEnts)
                 if (entDataTable[g].h > 0 && entDataTable[g].spr < SPRITES_NBR_SPRITES)
                     all.push_back(g);
+            // Moving stones / falling rocks (block ends with ent 38).
             for (int se : stoneEnts)
                 if (entDataTable[se].h > 0 && entDataTable[se].spr < SPRITES_NBR_SPRITES)
                     all.push_back(se);
+            // Barrels (61, 51, 74, 50) between ent 38 and ent 42, followed by
+            // the dogs (53, 66). 74 is the RUxP round-trip barrel; in legacy
+            // mode only the stock barrels (61, 51, 50) are shown.
+            for (int b : barrelEnts)
+                if (entDataTable[b].h > 0 && entDataTable[b].spr < SPRITES_NBR_SPRITES && (st.ruxp || b <= st.maxLegacyEnt()))
+                    all.push_back(b);
+            for (int d : dogEnts)
+                if (entDataTable[d].h > 0 && entDataTable[d].spr < SPRITES_NBR_SPRITES)
+                    all.push_back(d);
+            // Last block: fireball ball 42, sound trigger 43 (between 42 and
+            // 34), egyptian treasure 34/35, then the cranes 69, 60 after 35.
             for (int le : lastEnts)
                 if (entDataTable[le].h > 0 && entDataTable[le].spr < SPRITES_NBR_SPRITES)
                     all.push_back(le);
@@ -3828,8 +4245,8 @@ int main(int argc, char *argv[])
                     ImGui::PushID(i);
                     MarkEntry &m = list[i];
                     ImGui::SetNextItemWidth(50);
-                    ImGui::DragInt("##ent", &m.ent, 1.0f, 0, 255);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Entity type");
+                    ImGui::DragInt("##ent", &m.ent, 1.0f, 0, st.ruxp ? (int)entDataTable.size() - 1 : st.maxLegacyEnt());
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip(m.ent > st.maxLegacyEnt() && !st.ruxp ? "RUxF entity (needs Ultra Xpanded mode)" : "Entity type");
                     ImGui::SameLine();
                     ImGui::TextUnformatted("row");
                     ImGui::SameLine();
@@ -3881,7 +4298,7 @@ int main(int argc, char *argv[])
                     // flags might explain its behavior when they're just
                     // inert leftover bytes. Scope each control to the
                     // entity types that actually consult it instead.
-                    bool isType3 = m.ent >= 0x18;
+                    bool isType3 = m.ent >= 0x18 && m.ent != 0x4d;
                     bool isType1a = (m.ent == 4 || m.ent == 7 || m.ent == 10 || m.ent == 13);
                     bool isWalkerOrClimber = m.ent >= 4 && m.ent <= 15;
 
@@ -4173,7 +4590,7 @@ int main(int argc, char *argv[])
         // --- Render ---
         SDL_SetRenderDrawColor(renderer, 20, 20, 24, 255);
         SDL_RenderClear(renderer);
-        drawMap(renderer, blockAtlas[st.bank], st, connections, viewportW, viewportH);
+        drawMap(renderer, st.ruxp ? blockAtlasUni : blockAtlas[st.bank], st, connections, viewportW, viewportH);
 
         ImGui::Render();
         ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), renderer);

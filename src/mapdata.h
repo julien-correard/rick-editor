@@ -1077,7 +1077,10 @@ int map_bnums[0x1FD8] = {
  */
 
 
-int map_blocks[0x100] [16]={
+// 1024 blocks (RUxF expanded space, 4 pages of 256). Legacy maps use
+// the first 256; the rest zero-initialize and are only addressable in
+// RUxF mode.
+int map_blocks[0x400] [16]={
   {0x00, 0000, 0000, 0000, 0000, 0000, 0000, 0000,
    0000, 0000, 0000, 0000, 0000, 0000, 0000, 0000},
   {0x29, 0x2a, 0x2d, 0x2e, 0x2b, 0x2c, 0x2f, 0x30,

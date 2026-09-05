@@ -25,7 +25,7 @@ int main()
     for (int i = 0; i < 8; i++) tiles_data[0][decorStart][i] = 0x11223344 + i;
 
     fs::path tmp = fs::temp_directory_path() / "rickeditor_test_rkma.map";
-    if (!saveMapFileWithSprites(tmp, conn, marks, eflg, texts, err)) { std::printf("FAIL save: %s\n", err.c_str()); return 1; }
+    if (!saveMapFileWithSprites(tmp, conn, marks, eflg, texts, false, err)) { std::printf("FAIL save: %s\n", err.c_str()); return 1; }
 
     for (int i = 0; i < 8; i++) tiles_data[0][decorStart][i] = 0;
 

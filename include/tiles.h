@@ -38,6 +38,13 @@
 #define TILES_NBR_BANKS 3
 #endif
 
+// RUxF (Rick Ultra Xpanded) expands the game-tile space. The primary
+// "usable banks" are 1..4 (four pages of 256 tiles each, together a
+// single unified 1024-tile space; see the Page selectors in the Tile /
+// Block Editor windows). Bank 0 is separate and always holds only the
+// font + cutscene decor. Legacy maps use banks 1 and 2 (256*2 tiles).
+#define TILES_NBR_BANKS_MAX 5
+
 #define TILES_SIZEOF8 (0x10)
 #define TILES_SIZEOF16 (0x08)
 
@@ -59,9 +66,10 @@ typedef U32 tile_t[0x08];
 #endif
 
 /*
- * tiles banks (each bank is 0x100 tiles)
+ * tiles banks (each bank is 0x100 tiles); RUxF needs up to 5 (bank 0 =
+ * font/decor + 4 game-tile pages), so aliased to the max.
  */
-extern tile_t tiles_data[TILES_NBR_BANKS][0x100];
+extern tile_t tiles_data[TILES_NBR_BANKS_MAX][0x100];
 
 #endif
 

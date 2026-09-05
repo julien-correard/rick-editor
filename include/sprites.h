@@ -13,7 +13,7 @@
 
 #include "system.h"
 
-#define SPRITES_NBR_SPRITES 213
+#define SPRITES_NBR_SPRITES 214
 
 typedef U32 sprite_t[0x15][4]; /* 21 rows x 4 U32 (32px wide) per sprite */
 

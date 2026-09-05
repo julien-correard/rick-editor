@@ -56,7 +56,7 @@ using EflgTable = std::array<uint8_t, 256>; // per-tile flags, one bank
 
 struct EflgData
 {
-    std::array<EflgTable, 2> bank{}; // [0] = tile bank 1/page 0, [1] = bank 2/page 1
+    std::array<EflgTable, 4> bank{}; // [p] = hazard flags for tile page p+1 (4 pages in RUxF)
 };
 
 // One editable row in the UI: covers tiles [start, endTile] (inclusive)
@@ -211,4 +211,15 @@ inline bool repackEflg(const EflgData &data, uint8_t outCompressed32[/*32*/], st
 inline bool patchEflgSymbol(std::vector<uint8_t> &buf, const uint8_t compressed32[/*32*/], std::string &err)
 {
     return patch_symbol(buf, "map_eflg_c", compressed32, MAP_NBR_EFLGC, err);
+}
+
+// Flat RUxF hazard-flag table: the expanded engine indexes eflg by the
+// ABSOLUTE tile 0-1023 (banks 1-4 concatenated, one byte each). Differs from
+// the legacy RLE-compressed map_eflg_c (2 banks x 16 compressed bytes).
+inline std::vector<uint8_t> map_eflg_as_ruxf_bytes(const EflgData &eflg)
+{
+    std::vector<uint8_t> out(0x400);
+    for (int p = 0; p < 4; p++)
+        std::memcpy(out.data() + p * 256, eflg.bank[p].data(), 256);
+    return out;
 }

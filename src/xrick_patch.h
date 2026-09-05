@@ -525,6 +525,42 @@ inline std::vector<uint8_t> map_blocks_as_bytes()
     return out;
 }
 
+// RUxF packing: the expanded engine stores block numbers and block cells as
+// NATIVE U16 little-endian (block_t = U16[16], map_blocks[0x400] -- the
+// editor's own in-memory copies are `int[]` widened for the 0-1023 unified
+// space, so no clamp needed beyond the type). emitted to the same file layout
+// the engine's symbol declares.
+inline std::vector<uint8_t> map_bnums_as_ruxf_bytes()
+{
+    std::vector<uint8_t> out(MAP_COUNT * 2);
+    for (int i = 0; i < MAP_COUNT; i++)
+    {
+        uint16_t v = (uint16_t)std::clamp(map_bnums[i], 0, 0x3ff);
+        out[i * 2 + 0] = (uint8_t)(v & 0xff);
+        out[i * 2 + 1] = (uint8_t)(v >> 8);
+    }
+    return out;
+}
+
+inline std::vector<uint8_t> map_blocks_as_ruxf_bytes()
+{
+    std::vector<uint8_t> out(0x400 * 16 * 2);
+    for (int b = 0; b < 0x400; b++)
+        for (int i = 0; i < 16; i++)
+        {
+            uint16_t v = (uint16_t)std::clamp(map_blocks[b][i], 0, 0x3ff);
+            int o = (b * 16 + i) * 2;
+            out[o + 0] = (uint8_t)(v & 0xff);
+            out[o + 1] = (uint8_t)(v >> 8);
+        }
+    return out;
+}
+
+// Flat RUxF hazard-flag table: the expanded engine indexes eflg by the
+// ABSOLUTE tile 0-1023 (banks 1-4 concatenated, one byte each). Differs from
+// the legacy RLE-compressed map_eflg_c (2 banks x 16 compressed bytes).
+// (Defined in xrick_eflg.h, where EflgData is declared.)
+
 struct PatchResult { bool ok = false; std::string message; fs::path outputPath; };
 
 // Patches a copy of xrickPath with the level currently in map_bnums[],

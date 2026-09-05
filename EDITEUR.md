@@ -74,6 +74,10 @@ Screen Connections.
   cutscene decor (as of "RKMA"). Loading refuses any file whose element
   count doesn't match. A `*` next to the file name means there are
   unsaved changes.
+- **Use Rick Ultra Xpanded Features** -- toggles the RUxP mode on the
+  current map (see "Rick Ultra Xpanded Features" below). Ticking it shows
+  a confirmation dialog explaining that the resulting map is only
+  compatible with the modified 64-bit RUxP xrick build.
 - **Patch xrick binary...** -- injects the level currently open in the
   editor (layout + connections + sprites + tile hazard flags + tile
   graphics + block composition + sprite graphics + intro text) directly
@@ -124,6 +128,77 @@ untouched (see `src/test_xrick_patch.cpp`, for `map_bnums`; the same
 including `tiles_data`, `map_blocks`, `sprites_data`, and the 5 intro
 texts, each with its own round-trip check -- see the Tile Editor, Block
 Editor, Sprite Editor, and Text Editor sections below).
+
+## Rick Ultra Xpanded Features (RUxF)
+
+The editor has two map formats:
+
+- **Legacy** (magic `RKMB` and older) -- compatible with the original
+  stock xrick executable. Only entity ids 0-73 (the stock table) are
+  allowed, and only the stock 2-pages of game tiles/blocks are used.
+- **Rick Ultra Xpanded** (magic `RKMC`) -- may use the extended entity
+  ids (74, 75/76, 77) that only ship in the **modified
+  64-bit RUxF xrick build**, and expands the tile/block space. A legacy
+  xrick binary **cannot** be patched with an `RKMC` map.
+
+The **File ▸ Use Rick Ultra Xpanded Features** menu item toggles RUxF on
+the current map. Ticking it first shows a confirmation dialog explaining
+the compatibility constraint (the map must be patched into the RUxF
+build), then enables the mode. Unticking it returns to legacy.
+
+While in legacy mode, the new RUxF entities (74-77) are hidden from the
+ Sprite Tools quick-pick list and prevented from being placed or typed
+ into an existing sprite's entity field. Ticking RUxF makes the full
+ table (ids 0-77) available again.
+
+Entity 77 is the **RUxF life bonus** (sprite 213, index 0x00d5 -- a
+blank sprite slot added at the end of the table, drawn in the editor's
+Sprite Editor): picked up with fewer than 6 lives it gives Rick an
+extra life (no pickup animation); at 6 lives it hands out 500 points
+with the usual score popup. It behaves as a plain bonus -- no trigger flags;
+the engine spawns it in the bonus slots (4-8) and it respawns on map
+re-entry like any other mark. As with the other bonuses (18-21), while
+Rick is dying (zombie/falling or dead animation) he cannot collect
+anything -- `e_rick_boxtest()` rejects pickups until his respawn.
+
+The .map loader detects how many sprites a saved file actually holds
+(213 in older saves, 214 now) by scanning the self-describing tail
+(intro texts + bank-0 tiles + map start positions), so maps saved by
+earlier builds still open -- the extra sprite slots simply start blank.
+
+### 1024 tiles and blocks, split into 4 UI pages
+
+A RUxF map has a single unified **1024-tile** space (4 pages of 256) and
+a single unified **1024-block** space (4 pages of 256). There is no
+"active tile bank" anywhere: a block's 16 cells store *absolute* tile
+indices 0-1023, so every submap renders whatever tiles it references
+without picking a bank. Bank 0 (font + cutscene decor) stays separate
+and is never referenced from a block.
+
+Concretely, this means:
+- `tiles_data` grows to hold bank 0 + the 4 game-tile pages (banks 1-4);
+  `map_blocks` grows from 256 to 1024 shared blocks; the per-tile hazard
+  flags (`eflg`) grow from 2 to 4 pages.
+- A `Page 1-4` selector drives the Block Palette, the Block Editor's
+  block grid and tile picker, and the Tile Editor's page tabs.
+- The level canvas renders though a unified 1024-block atlas in RUxF
+  (no bank radio); legacy keeps the active-bank renderer.
+
+### Detection and patching
+
+Detection of a RUxF-capable executable is done via the `ent_entdata`
+ELF symbol size: `entdata_t` is 10 bytes, so the stock 74-entry binary
+is 740 bytes while the RUxF build (78 entries) is 780 bytes. When patching
+an `RKMC` map, the editor refuses targets whose `ent_entdata` is smaller
+than 770 bytes (i.e. an original binary).
+
+The `.map` magic field is the format marker: `RKMD` marks the current RUxF
+save (4-page tile/eflg/block sections **and** the new height-aware connector
+format, see below), `RKMC` is the older RUxP save (same 4-page sections but
+the old connector layout), `RKMB` is legacy. All RUxF magics load through the
+same code path, with the section size chosen from the magic (`RKMD`/`RKMC`
+read 4 tile/eflg/block pages; everything else 2). Entities 74+ require the
+modified RUxF build regardless of RKMC/RKMD.
 
 ## Files
 
@@ -298,6 +373,65 @@ now include the full screen-connection graph (`File > Save` / `Open...`).
 Older bnums-only `.map` files still open fine; they just leave the
 connections as they currently are (default or previously loaded).
 
+### RUxF connectors (height-aware, magic `RKMD`)
+
+In **RUxF** mode the connector format changes completely, to support
+side-scrolling transitions and **several exits from the same submap
+chosen by height** (as opposed to legacy submap screens, which are
+vertical chains with at most one Down and one Up exit):
+
+- **A trigger row is reintroduced, and the engine uses it.** The legacy
+  `{dir, rowout, submap, rowin}` (4-byte, per-submap-local rows) becomes
+  the RUxF `connect_t` (8 bytes, **absolute** rows):
+
+  ```
+  { U8 dir; U8 submap; U8 colin; U8 pad; U16 rowout; U16 rowin; }
+  ```
+
+  - `dir` -- `0` = Left, `1` = Right (Rick walks off the screen edge).
+  - `submap` -- destination submap, `0xff` = end of this world/map.
+  - `colin` -- arrival tile column 0-31 on the destination submap
+    (left edge ~0-3, right edge ~28-31). Rick lands centered there.
+  - `rowout` -- **exit tile row** (absolute) on the *owning* submap.
+    This is the trigger height.
+  - `rowin` -- arrival tile row (absolute) on the destination submap.
+
+  The engine's `map_frow` (the scrolling window) is always **relative** to
+  the current submap (`map_expand` reads `submap.bnum + map_frow`), so when
+  connecting two RUxF submaps the engine converts the absolute rows:
+
+  - **Selection** (bracketing): Rick's absolute row is
+    `submap.bnum/2 + map_frow + (y>>3)`; the first connector of the right
+    direction whose `rowout >=` that is chosen.
+  - **Teleport**: `raw = rowin - (y>>3) - dest.bnum/2`; `map_frow` must be a
+    multiple of 4 (block rows, see `map_expand`'s `(2*map_frow)&0xfff8`), so
+    the engine uses `map_frow = raw & ~3` and pushes Rick down by `(raw & 3)`
+    tile rows -- he still lands at exactly absolute row `rowin` on the
+    destination (the destination's own `bnum` is then added back by
+    `map_expand`). Only `rowin` and `colin` are imposed.
+
+- **Selection by height (bracketing)** -- the engine picks the connector
+  of the matching direction whose `rowout` is the **first one >= Rick's
+  current tile row** when he walks off the edge; if *all* of them are
+  above Rick, it falls back to the last one (the lowest). This lets one
+  submap expose several Left (or several Right) exits, one per floor
+  level. The bracketing assumes the submap's connectors are packed in
+  **ascending `rowout` order**, so `repackConnections()` sorts each
+  submap's exits by row before writing `map_connect` -- the on-screen
+  order in the editor (and the `.map` round-trip) is left exactly as
+  arranged.
+- **No `map_submaps[].page` tile-bank for RUxF** -- there's a single
+  unified 1024-tile space, so the per-submap `Tile bank` combo is hidden
+  in RUxF mode. The engine ignores the `page` field for RUxF submaps.
+- The RUxF `.map` save is magic **`RKMD`**; each exit is stored as the
+  5 int32s `{dir, rowout, submap, rowin, colin}` (absolute).
+- **UI offset** -- the connector's "tile row" fields in the RUxF UI show
+  `stored - 1` and an edit stores `typed + 1`: the row numbers the level
+  is laid out with read one below the stored connector value that makes
+  the engine teleport to that spot (verified empirically). Round-trip
+  stays stable.
+
+
 Per submap, in the **Screen Connections** window (only shown in Submap
 mode -- see Controls above):
 - **Start row**: directly editable -- this is the real stored value
@@ -319,7 +453,9 @@ mode -- see Controls above):
   own sprites and exits actually use *right now* -- not a stored value,
   just a practical sense of how far it's been built out.
 - **Tile bank** selector (1 or 2 -- same banks as the Block Palette;
-  maps to the engine's internal `page` field).
+  maps to the engine's internal `page` field). Hidden in RUxF mode,
+  where there is a single unified 1024-tile space and no per-submap
+  bank.
 - **Delete submap**: since the 47-entry `map_submaps` array can't
   shrink, "delete" means clearing this submap's own links and
   redirecting any other submap's link that pointed to it to "end of
@@ -692,6 +828,12 @@ sprites actually placed in the stock level (verified: ids 67-73 are used
 by real marks). Fixed by regenerating the table directly from the
 source, this time keeping `sni` too (needed for the feature above).
 
+The modified xrick build later added **ent 74** (the round-trip
+rolling barrel) and the **slow clones 75/76**, raising
+`ENT_NBR_ENTDATA` to `0x4d` = **77**; the editor's table carries all
+the extra rows too (`{18, 21, 106, 784}`, `{16, 8, 0, 791}` and
+`{32, 8, 108, 795}`).
+
 ### Behavior flags (`flags` checkboxes in Sprite Tools)
 
 Each sprite's "flags ->" row exposes the real `mark_t.flags` byte as
@@ -720,6 +862,55 @@ over it" is by far the most common case. Placing a walker (1a/1b/2)
 leaves all flags off, since they're unused. You can still untick `Rick`
 and tick a different TRIG* combination (or several at once) for traps
 that should instead react to a bullet, a bomb, or Rick's stop move.
+
+The barrel ("tonneau") and flame trap families get extra defaults
+(verified against `dat_ents.c`):
+
+- **Barrels 50/51/61** (sprites 106/107, 18x21): `50` falls down-left
+  (`mvstep` `{4,-4,0},{28,-2,+2}`), `51` rolls right (`{128,+3,0}`),
+  `61` rolls left (`{128,-3,0}`). Placing any of `50/51/52/74` now sets
+  `LethalWake` (0x08) by default, matching the stock marks for 51/52
+  (flags 0x88 / 0x4c).
+- **Ent 52 is a grille trap** (narrow trigger, 32x32 px), not a barrel:
+  it rises 32 px then slams down 32 px (`mvstep`
+  `{32,0,-1},{36,0,0},{4,0,+4},{2,0,+8}`).
+- **Flame traps 59/64** (24x16, trigger 3x3): invisible at rest, shoot a
+  flame to the LEFT on wake and stop after a moment; sprite shown in the
+  editor is 122 (the flame) for both (was 92 for 59 -- the game's hidden
+  resting sprite base). Placing them sets `LethalWake | LethalLoop`
+  (0x0C), matching the stock flags 0x88.
+- **Cranes 60/69** (24x17, sprite 104): `60` holds still 16 frames then
+  slides right, speeding up (+1 then +3 px/frame), cruises out ~168 px
+  at +2 px/frame and darts back left at 4 px/frame; `69` slides right
+  128 px, back left 64 px, right 108 px, then left 172 px, ending at its
+  start. Both loop.
+- **Ent 67/68** (24x21): the final-level explosion triggers -- they're
+  just there to start the destruction sequence on the game's last
+  screen. The editor shows sprite 38 for them.
+- **Ent 74** is the dedicated round-trip rolling barrel (18x21, wide
+  trigger 24x4), added by the modified xrick build: sprseq base 146
+  (sprites 106/150/107/151) and
+  mvstep 784 make it roll LEFT 20 tiles (160 px), then roll RIGHT back
+  to its start. It replaced ent 71's slot as the editor's "barrel".
+- **Missile 63** (32x8) shoots to the LEFT (`LethalWake | LethalLoop`
+  by default, 0x8C with the auto `Rick` trigger).
+- **Slow clones 75/0x4b and 76/0x4c** were added to the modified xrick
+  build (`ENT_NBR_ENTDATA` is now `0x4d` = 77). `75` is a clone of the
+  bullet trap 57 and `76` a clone of the missile 63; both charge a long
+  time (`75` ~150 frames, `76` ~200 frames) before firing the same
+  projectile as their original. In Sprite Tools they sit right after
+  their originals (75 after 57, 76 after 63).
+- **Lethal rock 48** (32x16) blocks the passage and is lethal;
+  default flags are `Bomb | Once | LethalLoop` (0x15, no `Rick`
+  trigger -- it wakes when dynamite hits it).
+
+Quick-pick chip order (from ent 38 onward, as requested): ent 39, the
+flame traps 59/64 right after it, the numeric run, then the grille
+traps 45/49/52 with lethal rock **48** right after them (between 52 and
+the moving stones 24, 28, 73, 31, 33, 36, **38**), then the barrels
+**61, 51, 74, 50** (between ent 38 and ent 42, followed by the dogs),
+and finally the last block **42, 43, 34, 35, 69, 60** (43 sits between
+42 and 34, and the cranes come after the treasure 35).
 
 ### Trigger point (`trigCol` / `trigRowOffset`)
 
@@ -1157,8 +1348,8 @@ Two differences from tiles, both consequences of the sprite format
 itself (`sprite_t` = 21 rows x 4 `U32`, i.e. 32x21 pixels, decoded by
 `decode_sprite()` in `sprites_render.h`) rather than editor design
 choices:
-- **No bank split** -- `sprites_data[213]` is one flat table, so there's
-  no bank selector anywhere in this window.
+- **No bank split** -- `sprites_data[214]` is one flat table, so there's
+   no bank selector anywhere in this window.
 - **No hazard flags** -- sprites don't have a `map_eflg_c`-style
   per-graphic flags byte; sprite behavior comes from the marks/triggers
   system (already covered by the existing "Sprite Tools" window), a
@@ -1172,7 +1363,7 @@ choices:
   so transparency is visible instead of blending into the window
   background.
 
-- **Grid** on the left: all 213 sprites. Click to select.
+- **Grid** on the left: all 214 sprites. Click to select.
 - **Detail panel** on the right: an enlarged preview (on checkerboard),
   and **Import from image...** -- resampled to 32x21 (box-filtered
   average per destination pixel, alpha channel included in the average),
@@ -1180,7 +1371,7 @@ choices:
 - **Batch import...** (collapsible section above the grid, same reasoning
   as the Tile Editor's): a **start sprite** number, then one image,
   sliced into *exact* 32x21 cells (no resampling), left-to-right then
-  top-to-bottom, one sprite per cell. Stops at sprite 212 (the last one
+  top-to-bottom, one sprite per cell. Stops at sprite 213 (the last one
   -- no wraparound); a leftover partial row/column of pixels (image size
   not an exact multiple of 32x21) is ignored rather than rejecting the
   image. Selecting a sprite in the grid also sets the batch start sprite

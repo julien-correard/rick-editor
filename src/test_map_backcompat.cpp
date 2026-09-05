@@ -18,7 +18,7 @@ int main()
     std::array<ImapText, SCREEN_IMAPTEXT_COUNT> texts = defaultImapTexts();
 
     fs::path tmp = fs::temp_directory_path() / "rickeditor_test_rkma_full.map";
-    if (!saveMapFileWithSprites(tmp, conn, marks, eflg, texts, err)) { std::printf("FAIL save: %s\n", err.c_str()); return 1; }
+    if (!saveMapFileWithSprites(tmp, conn, marks, eflg, texts, false, err)) { std::printf("FAIL save: %s\n", err.c_str()); return 1; }
 
     // Tronque le fichier pour retirer le bloc bank-0 (256 * sizeof(tile_t)
     // = 256*32 = 8192 octets a la fin) et change le magic en "RKM9".

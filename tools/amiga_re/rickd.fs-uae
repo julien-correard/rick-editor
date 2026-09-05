@@ -1,0 +1,19 @@
+# FS-UAE configuration for reverse-engineering Rick Dangerous Amiga (rickd.adf)
+# Boots the trainer-pack disk under Kickstart 1.3 and enables the console debugger.
+# Absolute paths (project dir has spaces, but absolute path works fine).
+#
+# IMPORTANT: launch as `fs-uae /path/to/this/file` (positional arg), NOT
+# `fs-uae --config=...` (that flag sets a search path, not the config to run).
+
+amiga_model = A500
+
+kickstart_file = /home/julien/Documents/Programmation/Editeur niveau Rick/Rick Editor/tools/amiga_re/kick13.rom
+
+floppy_drive_0 = /home/julien/Documents/Programmation/Editeur niveau Rick/Rick Editor/tools/amiga_re/rickd.adf
+
+# Built-in UAE debugger (console). Enter it during play with F12+D.
+console_debugger = 1
+
+fullscreen = 0
+window_width = 720
+window_height = 568

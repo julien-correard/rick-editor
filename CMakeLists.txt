@@ -50,3 +50,18 @@ target_compile_options(rickeditor PRIVATE -Wall)
 # a editor.cpp (seul fichier qui l'inclut avec STB_IMAGE_IMPLEMENTATION),
 # meme approche que pour dat_spritesST.c ci-dessus.
 set_source_files_properties(src/editor.cpp PROPERTIES COMPILE_OPTIONS "-Wno-unused-function")
+
+# -- map2c: converts an RUxF (.map/RKMC) file into the C data file
+#    (game_ruxf.c) that the modified RUxF xrick engine compiles instead of
+#    its stock dat_*.c data. Links the data globals (tiles_data, sprites_data)
+#    and reuses this project's own repack/encode headers so the emitted
+#    arrays match what the editor would write into a patched binary.
+add_executable(map2c
+    src/map2c.cpp
+    src/dat_tilesST.c
+    src/dat_spritesST.c
+)
+set_source_files_properties(src/dat_spritesST.c PROPERTIES COMPILE_OPTIONS "-Wno-missing-braces")
+target_include_directories(map2c PRIVATE include src third_party)
+target_compile_options(map2c PRIVATE -Wall)
+set_target_properties(map2c PROPERTIES OUTPUT_NAME rickeditor-map2c)
